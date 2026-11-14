@@ -1,0 +1,1556 @@
+"""Raptor V5.91 independent analytical-content subsystem.
+
+All analytics records live under state['_analytics']; news queue/configuration is read-only.
+Analytical research automatically rotates through enabled Gemini, Groq and Mistral providers.
+No operation publishes without explicit post approval and image validation.
+"""
+from __future__ import annotations
+
+import copy
+import hashlib
+import json
+import logging
+import os
+import re
+import time
+import uuid
+import ipaddress
+import socket
+from datetime import datetime, timedelta, timezone
+from urllib.parse import quote_plus, urlparse
+
+import requests
+import analytical_style as style_engine
+
+log = logging.getLogger("raptor-analytics")
+FOOTER = "\n\n#raptor\n————————\n@khaatshekaan"
+MAX_POST_CHARS = 1020
+MIN_POSTS = 5
+MAX_POSTS = 6
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+DEFAULT_TZ = "Asia/Tehran"
+SCHEMA_VERSION = 5
+
+class AnalyticsError(RuntimeError):
+    """Expected user-facing analytics error."""
+
+
+class AIUnavailableError(AnalyticsError):
+    """Provider credentials or service are temporarily unavailable; task is retryable."""
+
+
+def now_ts() -> float:
+    return time.time()
+
+
+def _default_settings() -> dict:
+    return {
+        "timezone": os.getenv("ANALYTICS_TIMEZONE", DEFAULT_TZ),
+        "schedule_mode": "auto", "paused": False,
+        "start_hour": 14, "end_hour": 21, "min_news_gap_minutes": 20,
+        "require_image": True, "target_chat_id": os.getenv("ANALYTICS_TARGET_CHAT_ID", os.getenv("TARGET_CHAT_ID", "")).strip(),
+        "auto_reschedule": True, "daily_project_limit": 1,
+        "default_post_count": 6, "default_tone": "تحلیلی، طبیعی و گفت‌وگومحور",
+        "custom_writing_instructions": "", "style_profile_version": style_engine.STYLE_VERSION,
+        "style_quality_review": True,
+        # Analytical research is autonomous by default: all enabled providers are tried,
+        # and retryable work is persisted until a provider/search endpoint recovers.
+        "auto_failover": True,
+        "queue_when_ai_unavailable": True,
+        "updated_at": now_ts(),
+    }
+
+
+def ensure_state(state: dict) -> dict:
+    """Migrate analytics schema in place while preserving all pre-existing data."""
+    a = state.get("_analytics")
+    if not isinstance(a, dict):
+        a = {}
+        state["_analytics"] = a
+    previous_schema = int(a.get("schema_version", 0) or 0)
+    a.setdefault("schema_version", SCHEMA_VERSION)
+    a.setdefault("projects", {})
+    a.setdefault("settings", {})
+    for key, value in _default_settings().items():
+        a["settings"].setdefault(key, value)
+    # V4 makes automatic provider failover and durable retry the default, including
+    # installations whose earlier V5.7 migration had stored these flags as False.
+    if previous_schema < 4:
+        a["settings"]["auto_failover"] = True
+        a["settings"]["queue_when_ai_unavailable"] = True
+        a["settings"]["automatic_provider_selection"] = True
+    a["settings"].setdefault("automatic_provider_selection", True)
+    a["settings"].setdefault("custom_writing_instructions", "")
+    a["settings"].setdefault("style_profile_version", style_engine.STYLE_VERSION)
+    a["settings"].setdefault("style_quality_review", True)
+    # Never discard manager instructions during migration; only cap oversized payloads.
+    a["settings"]["custom_writing_instructions"] = str(a["settings"].get("custom_writing_instructions", ""))[:style_engine.MAX_CUSTOM_INSTRUCTIONS]
+    a.setdefault("history", [])
+    a.setdefault("runtime_errors", [])
+    a.setdefault("ai_queue", [])
+    if not isinstance(a["ai_queue"], list):
+        a["ai_queue"] = []
+    a.setdefault("created_at", now_ts())
+    a["schema_version"] = SCHEMA_VERSION
+    # Defensive migration: old or manually edited records should not break the UI loop.
+    if not isinstance(a["projects"], dict):
+        raise AnalyticsError("ساختار پروژه‌های تحلیلی خراب است؛ state را بدون نسخه پشتیبان بازنویسی نکن.")
+    for p in a["projects"].values():
+        if not isinstance(p, dict):
+            continue
+        p.setdefault("target_post_count", int(a["settings"].get("default_post_count", 6) or 6))
+        for key, default in {
+            "sources": [], "images": [], "posts": [], "errors": [], "versions": [],
+            "article_versions": [], "approved_article": False, "approved_posts": False,
+            "archived": False, "paused": False, "last_error": "", "history": [], "schedule_mode": "",
+        }.items():
+            p.setdefault(key, copy.deepcopy(default))
+        for post in p.get("posts", []):
+            if not isinstance(post, dict):
+                continue
+            for key, default in {
+                "images": [], "image_candidates": [], "attempts": [], "versions": [],
+                "status": "draft", "scheduled_ts": None, "telegram_message_id": None,
+                "created_at": p.get("created_at", now_ts()), "updated_at": p.get("updated_at", now_ts()),
+            }.items():
+                post.setdefault(key, copy.deepcopy(default))
+            post.setdefault("char_count", len(str(post.get("text", ""))))
+    return a
+
+
+def _append_history(project: dict, action: str, detail: str = "", user_id=None) -> None:
+    event = {"at": now_ts(), "action": str(action)[:80], "detail": str(detail or "")[:500]}
+    if user_id is not None:
+        event["user_id"] = int(user_id)
+    project.setdefault("history", []).append(event)
+    project["history"] = project["history"][-300:]
+    project["updated_at"] = now_ts()
+    a_errors = project.setdefault("errors", [])
+    if action == "error":
+        a_errors.append({"at": event["at"], "error": event["detail"]})
+        project["errors"] = a_errors[-100:]
+
+
+def new_project(state: dict, kind: str, source_text: str, owner_id) -> dict:
+    a = ensure_state(state)
+    if kind not in {"research", "source_text"}:
+        raise AnalyticsError("نوع پروژه نامعتبر است.")
+    text = (source_text or "").strip()
+    if not text:
+        raise AnalyticsError("موضوع یا متن ورودی خالی است.")
+    if len(text) > 60000:
+        raise AnalyticsError("متن ورودی بیش از حد طولانی است (حداکثر ۶۰۰۰۰ نویسه).")
+    pid = uuid.uuid4().hex[:12]
+    title = text.splitlines()[0][:100].strip()
+    project = {
+        "id": pid, "title": title, "kind": kind,
+        "source_text": text if kind == "source_text" else "",
+        "topic": text if kind == "research" else "", "article": "", "sources": [], "images": [], "posts": [],
+        "status": "queued", "owner_id": int(owner_id), "created_at": now_ts(), "updated_at": now_ts(),
+        "errors": [], "versions": [], "article_versions": [], "approved_article": False,
+        "approved_posts": False, "next_post_index": 0, "publish_day": "", "last_error": "",
+        "schedule_mode": "", "archived": False, "paused": False, "history": [], "source_sufficient": None, "ai_provider_override": "gemini",
+        "split_note": "", "research_grounding": {},
+        "target_post_count": int(a["settings"].get("default_post_count", 6) or 6),
+    }
+    a["projects"][pid] = project
+    _append_history(project, "created", f"kind={kind}", owner_id)
+    return project
+
+
+def _extract_text(payload: dict) -> str:
+    try:
+        return "".join(part.get("text", "") for cand in payload.get("candidates", [])[:1]
+                       for part in cand.get("content", {}).get("parts", []) if isinstance(part, dict)).strip()
+    except Exception:
+        return ""
+
+
+def _redact(value, keys=()) -> str:
+    text = str(value or "")
+    for secret in keys:
+        if secret:
+            text = text.replace(secret, "[REDACTED]")
+    text = re.sub(r"(?i)(key=)[^&\s]+", r"\1[REDACTED]", text)
+    text = re.sub(r"https://generativelanguage\.googleapis\.com/[^\s]+", "[GEMINI_ENDPOINT_REDACTED]", text)
+    return text[:500]
+
+
+def gemini_call(prompt: str, *, model=None, use_search=False, timeout=90):
+    keys = [x.strip() for x in os.getenv("GEMINI_API_KEYS", "").split(",") if x.strip()]
+    if not keys:
+        raise AIUnavailableError("GEMINI_API_KEYS تنظیم نشده است؛ عملیات هوش مصنوعی قابل اجرا نیست.")
+    # Keep analytics model configuration independent from the news subsystem's GEMINI_MODEL.
+    model = model or os.getenv("ANALYTICS_GEMINI_MODEL", "gemini-3.8-flash")
+    model = re.sub(r"[^A-Za-z0-9._-]", "", model)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+    body = {"contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.25, "maxOutputTokens": 8192}}
+    if use_search:
+        body["tools"] = [{"google_search": {}}]
+    errors = []
+    retryable_failure = False
+    for key in keys:
+        try:
+            r = requests.post(url, params={"key": key}, json=body, timeout=timeout)
+            if r.status_code >= 400:
+                detail = f"HTTP {r.status_code}: {_redact(r.text[:250], keys)}"
+                errors.append(detail)
+                if r.status_code in {408, 409, 425, 429, 500, 502, 503, 504}:
+                    retryable_failure = True
+                continue
+            payload = r.json()
+            result = _extract_text(payload)
+            if not result:
+                errors.append("پاسخ Gemini فاقد متن بود.")
+                continue
+            return result, payload
+        except requests.RequestException as exc:
+            retryable_failure = True
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
+    message = "Gemini در تمام کلیدهای تنظیم‌شده ناموفق بود؛ مقاله ناقص تأیید/منتشر نشد. " + " | ".join(errors[-3:])
+    if retryable_failure or not errors:
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
+
+
+def _openai_compatible_call(provider: str, prompt: str, timeout=90):
+    """Call Groq or Mistral through their OpenAI-compatible chat-completions APIs."""
+    provider = str(provider or "").lower()
+    if provider == "groq":
+        keys = [x.strip() for x in os.getenv("GROQ_API_KEYS", os.getenv("GROQ_API_KEY", "")).split(",") if x.strip()]
+        url = "https://api.groq.com/openai/v1/chat/completions"
+        model = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+    elif provider == "mistral":
+        keys = [x.strip() for x in os.getenv("MISTRAL_API_KEYS", os.getenv("MISTRAL_API_KEY", "")).split(",") if x.strip()]
+        url = "https://api.mistral.ai/v1/chat/completions"
+        model = os.getenv("MISTRAL_MODEL", "mistral-small-latest")
+    else:
+        raise AnalyticsError("ارائه‌دهنده جایگزین پشتیبانی نمی‌شود.")
+    if not keys:
+        raise AIUnavailableError(f"کلید API برای {provider} تنظیم نشده است؛ عملیات قابل اجرا نیست.")
+    errors = []
+    retryable_failure = False
+    for key in keys:
+        try:
+            r = requests.post(url, headers={"Authorization": f"Bearer {key}"}, json={
+                "model": model,
+                "messages": [{"role": "system", "content": "دستیار پژوهشی دقیق فارسی‌زبان؛ هیچ منبع یا واقعیتی را جعل نکن."},
+                             {"role": "user", "content": prompt}],
+                "temperature": 0.25, "max_tokens": 8192,
+            }, timeout=timeout)
+            if r.status_code >= 400:
+                errors.append(f"HTTP {r.status_code}: {_redact(r.text[:200], keys)}")
+                if r.status_code in {401, 403, 408, 409, 425, 429, 500, 502, 503, 504}:
+                    retryable_failure = True
+                continue
+            obj = r.json()
+            content = obj.get("choices", [{}])[0].get("message", {}).get("content", "")
+            if isinstance(content, list):
+                content = "".join(str(x.get("text", "")) for x in content if isinstance(x, dict))
+            if content and str(content).strip():
+                return str(content).strip(), obj
+            errors.append("پاسخ فاقد متن بود.")
+        except requests.RequestException as exc:
+            retryable_failure = True
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
+        except Exception as exc:
+            errors.append(f"{type(exc).__name__}: {_redact(exc, keys)}")
+    message = f"ارائه‌دهنده {provider} ناموفق بود: {' | '.join(errors[-2:])}"
+    if retryable_failure or not errors:
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
+
+
+def _rotate_project_provider_order(project: dict) -> None:
+    runtime = project.get("_ai_runtime") if isinstance(project.get("_ai_runtime"), dict) else None
+    if not runtime:
+        return
+    order = [str(x).lower() for x in runtime.get("provider_order", [])
+             if str(x).lower() in {"gemini", "groq", "mistral"}]
+    if len(order) > 1:
+        order = order[1:] + order[:1]
+        runtime["provider_order"] = order
+        runtime["enabled_providers"] = list(order)
+        if not runtime.get("manual_provider_override"):
+            project["ai_provider_override"] = order[0]
+
+
+def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90):
+    """Use every enabled provider automatically; an explicit manual override stays exclusive."""
+    primary = str(project.get("ai_provider_override") or "gemini").lower()
+    runtime = project.get("_ai_runtime") if isinstance(project.get("_ai_runtime"), dict) else {}
+    auto_failover = bool(runtime.get("auto_failover", True))
+    enabled = runtime.get("enabled_providers", [])
+    order = runtime.get("provider_order", [])
+
+    valid_providers = {"gemini", "groq", "mistral"}
+    enabled_set = {str(x).lower() for x in enabled if str(x).lower() in valid_providers}
+    enforce_enabled = bool(runtime.get("enforce_enabled", False))
+    manual_override = bool(runtime.get("manual_provider_override", False))
+    normalized_order = list(dict.fromkeys(str(x).lower() for x in order if str(x).lower() in valid_providers))
+    if auto_failover and not manual_override:
+        # The caller may rotate this order between jobs. Do not put Gemini first
+        # merely because it was the historical default provider.
+        candidates = normalized_order or ["groq", "gemini", "mistral"]
+    elif auto_failover:
+        candidates = [primary] + normalized_order
+        candidates = list(dict.fromkeys(x for x in candidates if x in valid_providers))
+    else:
+        candidates = [primary] if primary in valid_providers else ["gemini"]
+    if enforce_enabled:
+        candidates = [x for x in candidates if x in enabled_set]
+
+    errors = []
+    for provider in candidates:
+        try:
+            if provider == "gemini":
+                result = gemini_call(prompt, use_search=use_search, timeout=timeout)
+            else:
+                alternate_prompt = prompt
+                if use_search:
+                    alternate_prompt += "\nتوجه: این مرحله با ارائه‌دهنده جایگزین انجام می‌شود؛ نتایج واقعی جست‌وجوی پیوست‌شده را مبنا قرار بده؛ Google Search grounding در این مرحله فعال نیست."
+                result = _openai_compatible_call(provider, alternate_prompt, timeout=timeout)
+            project["last_ai_provider"] = provider
+            return result
+        except AnalyticsError as exc:
+            errors.append(f"{provider}: {str(exc)[:260]}")
+            if not auto_failover:
+                raise
+            continue
+
+    if not candidates:
+        raise AIUnavailableError("هیچ ارائه‌دهنده فعال و مجازی برای این پروژه تحلیلی در دسترس نیست؛ پروژه می‌تواند در صف انتظار بماند.")
+    message = "تمام ارائه‌دهندگان فعال محتوای تحلیلی ناموفق بودند: " + " | ".join(errors[-3:])
+    retryable_markers = ("HTTP 401", "HTTP 403", "HTTP 408", "HTTP 409", "HTTP 425",
+                         "HTTP 429", "HTTP 5", "Timeout", "Connection", "RequestException")
+    if any(marker in error for error in errors for marker in retryable_markers):
+        raise AIUnavailableError(message)
+    raise AnalyticsError(message)
+
+
+def enqueue_ai_task(state: dict, project_id: str, operation: str, *, args=None, owner_id=None, error="") -> dict:
+    """Persist a retryable analytical AI task without altering news queues."""
+    a = ensure_state(state)
+    valid_operations = {"research", "split"}
+    if operation not in valid_operations:
+        raise AnalyticsError("نوع کار صف هوش مصنوعی تحلیلی پشتیبانی نمی‌شود.")
+    project = a["projects"].get(str(project_id))
+    if not project:
+        raise AnalyticsError("پروژه برای ورود به صف هوش مصنوعی پیدا نشد.")
+    for existing in a["ai_queue"]:
+        if (isinstance(existing, dict) and existing.get("project_id") == str(project_id)
+                and existing.get("operation") == operation and existing.get("status") in {"queued", "processing"}):
+            return existing
+    task = {
+        "id": uuid.uuid4().hex[:12], "project_id": str(project_id), "operation": operation,
+        "args": copy.deepcopy(args or {}), "owner_id": int(owner_id) if owner_id is not None else None,
+        "status": "queued", "attempts": 0, "created_at": now_ts(), "updated_at": now_ts(),
+        "next_attempt_at": now_ts(), "last_error": str(error or "")[:500],
+    }
+    a["ai_queue"].append(task)
+    a["ai_queue"] = a["ai_queue"][-300:]
+    project["status"] = "queued_ai"
+    project["queue_task_id"] = task["id"]
+    project["last_error"] = str(error or "در صف انتظار برای فعال‌شدن هوش مصنوعی")[:500]
+    _append_history(project, "ai_task_queued", f"operation={operation}; task={task['id']}", owner_id)
+    return task
+
+
+def _search_url_from_ddg(href: str) -> str:
+    """Resolve DuckDuckGo's redirect links to their actual public destination."""
+    from urllib.parse import parse_qs, unquote, urlparse
+    raw = unquote(str(href or "").strip())
+    if raw.startswith("//"):
+        raw = "https:" + raw
+    parsed = urlparse(raw)
+    if parsed.hostname and parsed.hostname.endswith("duckduckgo.com"):
+        target = parse_qs(parsed.query).get("uddg", [""])[0]
+        if target:
+            raw = unquote(target)
+            parsed = urlparse(raw)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return ""
+    if parsed.hostname in {"duckduckgo.com", "html.duckduckgo.com", "bing.com"}:
+        return ""
+    return raw
+
+
+def _search_ddg(query: str, limit: int):
+    r = requests.get(
+        "https://html.duckduckgo.com/html/", params={"q": query},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
+    )
+    r.raise_for_status()
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(r.text, "html.parser")
+    results = []
+    for item in soup.select(".result"):
+        link = item.select_one("a.result__a")
+        snippet = item.select_one(".result__snippet")
+        if not link:
+            continue
+        url = _search_url_from_ddg(link.get("href", ""))
+        if not url:
+            continue
+        results.append({
+            "title": link.get_text(" ", strip=True), "url": url,
+            "snippet": snippet.get_text(" ", strip=True) if snippet else "",
+            "retrieved_at": now_ts(), "search_provider": "DuckDuckGo",
+        })
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_bing_rss(query: str, limit: int):
+    """Bing RSS provides a lightweight independent fallback if DDG HTML is blocked."""
+    import xml.etree.ElementTree as ET
+    r = requests.get(
+        "https://www.bing.com/search", params={"q": query, "format": "rss"},
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
+    )
+    r.raise_for_status()
+    root = ET.fromstring(r.text)
+    results = []
+    for item in root.findall(".//item"):
+        title = (item.findtext("title") or "").strip()
+        url = _search_url_from_ddg(item.findtext("link") or "")
+        snippet = (item.findtext("description") or "").strip()
+        if not title or not url:
+            continue
+        results.append({"title": title, "url": url, "snippet": snippet,
+                        "retrieved_at": now_ts(), "search_provider": "Bing RSS"})
+        if len(results) >= limit:
+            break
+    return results
+
+
+def _search_wikipedia(query: str, limit: int):
+    """Small factual-background fallback; not treated as a substitute for diverse sources."""
+    r = requests.get(
+        "https://en.wikipedia.org/w/api.php",
+        params={"action": "query", "list": "search", "srsearch": query,
+                "srlimit": min(8, max(1, limit)), "format": "json", "utf8": 1},
+        headers={"User-Agent": "RaptorAnalytics/5.91 (research bot)"}, timeout=15,
+    )
+    r.raise_for_status()
+    rows = r.json().get("query", {}).get("search", [])
+    results = []
+    for row in rows:
+        title = str(row.get("title", "")).strip()
+        pageid = row.get("pageid")
+        if not title or not pageid:
+            continue
+        results.append({"title": title, "url": f"https://en.wikipedia.org/?curid={int(pageid)}",
+                        "snippet": re.sub(r"<[^>]+>", " ", str(row.get("snippet", ""))),
+                        "retrieved_at": now_ts(), "search_provider": "Wikipedia"})
+    return results
+
+
+def web_search(query: str, limit=8):
+    """Multi-engine search with deduplication; transient search outages remain retryable."""
+    q = (query or "").strip()
+    if not q:
+        return []
+    merged, seen, errors = [], set(), []
+    engines = (
+        ("DuckDuckGo", _search_ddg),
+        ("Bing RSS", _search_bing_rss),
+        ("Wikipedia", _search_wikipedia),
+    )
+    for label, search_fn in engines:
+        try:
+            batch = search_fn(q, max(1, min(10, int(limit))))
+            for item in batch:
+                url = str(item.get("url", "")).strip()
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                merged.append(item)
+                if len(merged) >= max(1, int(limit)):
+                    break
+            if len(merged) >= max(1, int(limit)):
+                break
+        except Exception as exc:
+            errors.append(f"{label}: {type(exc).__name__}")
+            log.warning("Analytics search provider %s unavailable: %s", label, type(exc).__name__)
+    if len(merged) < 3:
+        detail = "; ".join(errors[-3:]) or "نتایج معتبر کافی دریافت نشد"
+        raise AIUnavailableError(
+            f"جست‌وجوی وب فعلاً کمتر از ۳ نتیجه معتبر پیدا کرد ({len(merged)} نتیجه). "
+            f"پروژه در صف می‌ماند و خودکار دوباره تلاش می‌شود. {detail}"
+        )
+    # Search snippets alone are not enough for a technical research article.
+    # Fetch a bounded amount of public page text for each result where possible.
+    return _enrich_search_results(merged[:max(1, int(limit))])
+
+
+def _public_http_url(url: str) -> bool:
+    """Conservative public-web URL check to avoid fetching local/private targets."""
+    parsed = urlparse(str(url or ""))
+    if parsed.scheme != "https" or not parsed.hostname:
+        return False
+    host = parsed.hostname.lower().rstrip(".")
+    if host in {"localhost", "metadata.google.internal"} or host.endswith((".local", ".internal", ".localhost")):
+        return False
+    try:
+        addresses = {row[4][0] for row in socket.getaddrinfo(host, parsed.port or 443, type=socket.SOCK_STREAM)}
+        return bool(addresses) and all(ipaddress.ip_address(addr).is_global for addr in addresses)
+    except Exception:
+        return False
+
+
+def _fetch_public_page(url: str, timeout=12) -> tuple[str, str]:
+    if not _public_http_url(url):
+        return "", "not_fetched_nonpublic_or_unverified"
+    try:
+        # Redirects are deliberately disabled; every fetched host must be verified first.
+        response = requests.get(url, headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorResearch/5.91)"},
+                                timeout=timeout, allow_redirects=False, stream=True)
+        if response.status_code in {301, 302, 303, 307, 308}:
+            response.close()
+            return "", "redirect_not_followed"
+        if response.status_code != 200:
+            status = f"http_{response.status_code}"
+            response.close()
+            return "", status
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if not any(x in content_type for x in ("text/html", "application/xhtml+xml", "text/plain")):
+            response.close()
+            return "", "non_html_content"
+        payload = response.raw.read(1_500_000, decode_content=True)
+        response.close()
+        if "text/plain" in content_type:
+            return payload.decode("utf-8", errors="replace")[:6000], "ok_text"
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(payload, "html.parser")
+        for node in soup.select("script,style,noscript,nav,header,footer,aside,form,svg,button,iframe"):
+            node.decompose()
+        title = soup.title.get_text(" ", strip=True) if soup.title else ""
+        main = soup.find("article") or soup.find("main") or soup.body or soup
+        paragraphs = [node.get_text(" ", strip=True) for node in main.select("p")]
+        paragraphs = [re.sub(r"\s+", " ", item) for item in paragraphs if len(item) >= 45]
+        text = "\n".join(paragraphs)
+        if len(text) < 180:
+            text = main.get_text(" ", strip=True)
+        text = re.sub(r"\s+", " ", text).strip()[:6000]
+        return (("TITLE: " + title + "\n" if title else "") + text, "ok_html" if len(text) >= 180 else "short_page")
+    except Exception as exc:
+        return "", "fetch_error:" + type(exc).__name__
+
+
+def _enrich_search_results(results: list[dict], max_pages=6) -> list[dict]:
+    enriched = []
+    for index, item in enumerate(results):
+        record = dict(item)
+        if index < max_pages:
+            content, status = _fetch_public_page(str(record.get("url", "")))
+        else:
+            content, status = "", "snippet_only_limit"
+        record["content_excerpt"] = content
+        record["fetch_status"] = status
+        record["fetched_at"] = now_ts() if content else None
+        enriched.append(record)
+    return enriched
+
+
+def _split_article_sources(text: str):
+    """Keep the publishable article separate from source metadata."""
+    raw = (text or "").strip()
+    article = raw
+    match = re.search(r"(?is)(?:^|\n)\s*(?:SOURCES|منابع|منابع مورد استفاده)\s*:?\s*\n", raw)
+    if match:
+        article = raw[:match.start()].strip()
+    article = re.sub(r"(?is)^\s*(?:ARTICLE|مقاله)\s*:?\s*\n", "", article).strip()
+    # Citation markers remain in the research record but are not rendered into channel posts.
+    return article
+
+
+def research_project(project: dict):
+    topic = project.get("topic", "").strip()
+    if not topic:
+        raise AnalyticsError("موضوع تحقیق خالی است.")
+    results = web_search(topic, 8)
+    if len(results) < 3:
+        raise AnalyticsError(f"جست‌وجوی وب فقط {len(results)} نتیجه قابل استفاده داد؛ حداقل ۳ نتیجه لازم است تا تحقیق ضعیف به مقاله تبدیل نشود.")
+    sources = [{"title": x["title"], "url": x["url"], "snippet": x["snippet"],
+                "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review",
+                "search_provider": x.get("search_provider", "unknown"),
+                "content_excerpt": x.get("content_excerpt", ""),
+                "fetch_status": x.get("fetch_status", "snippet_only"),
+                "fetched_at": x.get("fetched_at")} for x in results]
+    evidence = "\n\n".join(
+        f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه جست‌وجو: {s['snippet']}\n"
+        f"وضعیت دریافت صفحه: {s.get('fetch_status', 'snippet_only')}\nمتن استخراج‌شده از صفحه: {s.get('content_excerpt') or 'متن کامل صفحه دریافت نشد؛ فقط خلاصه جست‌وجو موجود است.'}"
+        for i, s in enumerate(sources))
+    custom_style = str(project.get("_style_custom_instructions", ""))
+    prompt = (
+        style_engine.build_style_prompt(custom_style, "research")
+        + "\n\nنقش: پژوهشگر و نویسنده فارسی‌زبان. از نتایج جست‌وجوی واقعی پیوست و در صورت نیاز Google Search grounding استفاده کن. "
+        "منابع را در گزارش مدیریتی جدا کن؛ نام منابع/مستندات، فهرست منبع و هیچ URL را داخل ARTICLE نیاور و فقط در SOURCES ثبت کن. "
+        "هیچ عدد، تاریخ، منبع یا پیوندی جعل نکن. گزارش منابع را جای مقاله نگذار. "
+        "برای هر منبع، عنوان و خلاصه جست‌وجو و در صورت موفقیت متن استخراج‌شده از صفحه واقعی پیوست شده است. "
+        "در مواردی که متن صفحه دریافت نشده، فقط به همان خلاصه محدود بمان و وانمود نکن کل سند را خوانده‌ای. "
+        "ادعاهای فنی مهم را با چند منبع مستقل موجود تطبیق بده؛ اگر پشتوانه چندمنبعی وجود ندارد، آن را قطعی ننویس. "
+        "میان داده تأییدشده، گزارش تأییدنشده، برآورد/تحلیل، اختلاف منابع و اطلاعات ناکافی تمایز بگذار. "
+        "مشخصات نسخه‌های مختلف تجهیزات را مخلوط نکن. تاریخ انتشار منبع و تاریخ رویداد را در صورت وجود تفکیک کن. "
+        "اگر شواهد کافی نیست، آن محدودیت را در متن مدیریتی و نه در ادعای قطعی توضیح بده. "
+        "خروجی فارسی و دقیق با دو بخش ARTICLE و SOURCES باشد؛ SOURCES فقط در پنل مدیر استفاده می‌شود.\n\n"
+        f"موضوع: {topic}\n\nنتایج جست‌وجوی وب:\n{evidence}"
+    )
+    article, raw = "", {}
+    last_output_error = ""
+    for attempt in range(3):
+        result, raw = project_ai_call(project, prompt, use_search=True)
+        article = _split_article_sources(result)
+        if len(article) >= 100:
+            break
+        last_output_error = "پاسخ مدل برای مقاله تحلیلی بیش از حد کوتاه بود."
+        _rotate_project_provider_order(project)
+    if len(article) < 100:
+        raise AnalyticsError(last_output_error or "خروجی تحقیق به مقاله کافی تبدیل نشد؛ پروژه برای بازبینی/تلاش مجدد حفظ شد.")
+    project["research_ai_provider"] = project.get("last_ai_provider") or project.get("ai_provider_override")
+    project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_research"})
+    project["article"] = article
+    project["sources"] = sources
+    project["approved_article"] = False
+    project["approved_posts"] = False
+    for old_post in project.get("posts", []):
+        if old_post.get("status") not in {"published", "sending", "uncertain"}:
+            old_post["status"] = "needs_review"
+            old_post["scheduled_ts"] = None
+            old_post["manual_schedule"] = False
+    candidate = (raw.get("candidates") or [{}])[0] if isinstance(raw, dict) else {}
+    grounding = candidate.get("groundingMetadata") if isinstance(candidate, dict) else None
+    known_urls = {str(x.get("url", "")) for x in sources}
+    if isinstance(grounding, dict):
+        for chunk in grounding.get("groundingChunks", []) or []:
+            web = chunk.get("web", {}) if isinstance(chunk, dict) else {}
+            url = str(web.get("uri", "")).strip()
+            if not url or url in known_urls or not url.startswith("https://"):
+                continue
+            sources.append({"title": str(web.get("title", "منبع Google Search grounding"))[:240], "url": url,
+                            "snippet": "منبع برگشتی از Google Search grounding؛ محتوای صفحه باید توسط مدیر بررسی شود.",
+                            "retrieved_at": now_ts(), "status": "needs_review", "origin": "gemini_grounding"})
+            known_urls.add(url)
+    project["sources"] = sources
+    project["research_grounding"] = {
+        "search_results": len(sources),
+        "search_providers": sorted({str(x.get("search_provider", "unknown")) for x in sources}),
+        "gemini_grounding_metadata": bool(grounding), "completed_at": now_ts(),
+        "provider": project.get("last_ai_provider") or project.get("ai_provider_override") or "unknown",
+        "method": "Multi-engine public web search; Gemini Google Search grounding used when Gemini completed the research" if project.get("last_ai_provider") == "gemini" else "Multi-engine public web search with attached search evidence",
+    }
+    project["status"] = "review_research"
+    project["last_error"] = ""
+    _append_history(project, "research_completed", f"sources={len(sources)}")
+    return project
+
+
+def _json_from_model(text: str) -> dict:
+    t = (text or "").strip()
+    t = re.sub(r"^```(?:json)?\s*|\s*```$", "", t, flags=re.I)
+    start, end = t.find("{"), t.rfind("}")
+    if start < 0 or end < start:
+        raise AnalyticsError("خروجی مدل JSON معتبر ندارد.")
+    try:
+        obj = json.loads(t[start:end + 1])
+    except Exception as exc:
+        raise AnalyticsError(f"JSON خروجی مدل نامعتبر است: {str(exc)[:160]}") from exc
+    if not isinstance(obj, dict):
+        raise AnalyticsError("ساختار JSON خروجی باید شیء باشد.")
+    return obj
+
+
+def _clean_body(text: str) -> str:
+    body = re.sub(r"\[(?:\d+)\]", "", str(text or "")).strip()
+    body = re.sub(r"(?m)^\s*(?:منابع|Sources)\s*:\s*.*$", "", body, flags=re.I)
+    body = re.sub(r"https?://\S+", "", body, flags=re.I)
+    body = re.sub(r"\n{3,}", "\n\n", body)
+    body = re.sub(re.escape(FOOTER) + r"\s*$", "", body).strip()
+    return body
+
+
+def _footer_text(text: str) -> str:
+    # Enforce the user's terminology preferences consistently across all providers.
+    body = style_engine.normalize_terminology(_clean_body(text))
+    return (body + FOOTER).strip() if body else ""
+
+
+def _call_split_model(project: dict, source: str, target_count: int, tone: str, strict: bool):
+    char_cap = 900 if strict else 925
+    custom_style = str(project.get("_style_custom_instructions", ""))
+    prompt = (
+        style_engine.build_style_prompt(custom_style, "telegram")
+        + "\n\nمتن زیر را به پست‌های مستقل اما پیوسته فارسی تلگرام تبدیل کن. خروجی فقط JSON معتبر باشد: "
+        '{"posts":[{"title":"...","text":"...","image_query":"..."}],"note":"...","source_sufficient":true}. '
+        f"هدف ۵ تا ۶ پست است؛ سقف خروجی حداکثر {MAX_POSTS} پست. تعداد هدف {target_count}. "
+        "فقط اگر منبع برای ۵ پست محتوای متمایز کافی ندارد کمتر تولید کن و علت را در note توضیح بده. "
+        f"هر متن پیش از footer حداکثر {char_cap} نویسه باشد. هیچ متن را با قطع ناگهانی جمله کوتاه نکن. "
+        "هر پست یک موضوع اصلی داشته باشد. پست اول معرفی جذاب و اهمیت موضوع را بگو؛ پست آخر نتیجه را روشن کند و پایان واقعی باشد. "
+        "به متن ورودی وفادار بمان؛ اطلاعات، اعداد، تاریخ‌ها و توانمندی جدید نساز. ارجاع‌های [n]، URL و فهرست منابع را وارد متن پست نکن. "
+        "برچسب‌های داخلی مانند تأییدشده با منبع، گزارش مستقل‌تأییدنشده، برآورد، اختلاف منابع یا اطلاعات ناکافی را به شکل برچسب/تیتر در کانال نمایش نده؛ اگر لازم است تردید را با نثر طبیعی و دقیق حفظ کن. "
+        "لحن طبیعی، دقیق، گفت‌وگومحور و متناسب با کانال فارسی‌زبان نظامی؛ بدون اغراق، بدون یادداشت ویراستاری. "
+        "برای هر پست image_query مشخص و مرتبط برای جست‌وجوی عکس واقعی پیشنهاد بده."
+        + (" طول هر پست را با حاشیه ایمنی بیشتر نگه دار." if strict else "")
+        + f"\nلحن: {tone}\n\nمتن منبع:\n{source}"
+    )
+    response, _ = project_ai_call(project, prompt)
+    obj = _json_from_model(response)
+    posts = obj.get("posts")
+    if not isinstance(posts, list):
+        raise AnalyticsError("فیلد posts در خروجی مدل وجود ندارد.")
+    return obj, posts
+
+
+def _quality_review_candidate_posts(project: dict, source: str, posts: list[dict]) -> list[dict]:
+    """Run an independent style/content review and one repair pass when needed."""
+    settings = project.get("_style_quality_review", True)
+    if not settings:
+        return posts
+    custom_style = str(project.get("_style_custom_instructions", ""))
+    prompt = style_engine.build_quality_review_prompt(posts, source, custom_style)
+    response, _ = project_ai_call(project, prompt)
+    review = _json_from_model(response)
+    if review.get("compliant") is True:
+        reviewed = posts
+    else:
+        raw_revised = review.get("posts")
+        if not isinstance(raw_revised, list) or not 1 <= len(raw_revised) <= MAX_POSTS:
+            raise AnalyticsError("بازبینی سبک، ایرادهایی پیدا کرد اما نسخه اصلاح‌شده معتبر برنگرداند.")
+        reviewed = []
+        for i, item in enumerate(raw_revised, 1):
+            if not isinstance(item, dict):
+                raise AnalyticsError(f"پست اصلاح‌شده شماره {i} ساختار معتبری ندارد.")
+            old = posts[i-1] if i <= len(posts) else {}
+            body = _clean_body(item.get("text", ""))
+            text = _footer_text(body)
+            if not body:
+                raise AnalyticsError(f"متن اصلاح‌شده پست {i} خالی است.")
+            reviewed.append({
+                **old,
+                "id": old.get("id") or uuid.uuid4().hex[:12],
+                "number": i,
+                "title": str(item.get("title") or old.get("title") or f"بخش {i}")[:140],
+                "text": text, "char_count": len(text),
+                "image_query": str(item.get("image_query") or old.get("image_query") or project.get("title", ""))[:240],
+                "images": copy.deepcopy(old.get("images", [])),
+                "image_candidates": copy.deepcopy(old.get("image_candidates", [])),
+                "status": "draft", "scheduled_ts": None, "telegram_message_id": None,
+                "updated_at": now_ts(), "style_validation_version": style_engine.STYLE_VERSION,
+            })
+    issues = []
+    for i, post in enumerate(reviewed, 1):
+        body = _clean_body(post.get("text", ""))
+        for issue in style_engine.style_issues(body):
+            issues.append(f"پست {i}: {issue}")
+        post["style_validation_version"] = style_engine.STYLE_VERSION
+        post["text"] = _footer_text(body)
+        post["char_count"] = len(post["text"])
+    if issues:
+        raise AnalyticsError("کنترل نهایی سبک پس از اصلاح همچنان ناموفق است: " + "؛ ".join(issues[:8]))
+    validation = validate_post_set(reviewed, require_images=False)
+    if validation:
+        raise AnalyticsError("خروجی اصلاح‌شده از اعتبارسنجی پایتون عبور نکرد: " + "؛ ".join(validation[:8]))
+    return reviewed
+
+
+def split_into_posts(project: dict, count=None, tone=None):
+    source = (project.get("article") or project.get("source_text") or "").strip()
+    if not source:
+        raise AnalyticsError("مقاله یا متن ورودی موجود نیست.")
+    target_count = max(MIN_POSTS, min(MAX_POSTS, int(count or project.get("target_post_count") or MAX_POSTS)))
+    tone = tone or os.getenv("ANALYTICS_DEFAULT_TONE", "تحلیلی، طبیعی و گفت‌وگومحور")
+    # First model attempt. Validation and style repair use the project's currently routed provider.
+    last_error = ""
+    for attempt in range(3):
+        try:
+            obj, raw_posts = _call_split_model(project, source, target_count, tone, strict=(attempt >= 1))
+            if not 1 <= len(raw_posts) <= MAX_POSTS:
+                raise AnalyticsError("تعداد خروجی پست‌ها خارج از محدوده است.")
+            candidate_posts = []
+            for i, item in enumerate(raw_posts[:MAX_POSTS], 1):
+                if not isinstance(item, dict):
+                    continue
+                body = _clean_body(item.get("text", ""))
+                text = _footer_text(body)
+                if not body:
+                    continue
+                if len(text) > MAX_POST_CHARS or len(text.encode("utf-16-le")) // 2 > 1024:
+                    raise AnalyticsError(f"پست {i} بعد از افزودن footer از سقف مجاز عبور کرده است.")
+                candidate_posts.append({
+                    "id": uuid.uuid4().hex[:12], "number": i,
+                    "title": str(item.get("title", f"بخش {i}"))[:140],
+                    "text": text, "char_count": len(text),
+                    "image_query": str(item.get("image_query", project.get("title", "military equipment")))[:240],
+                    "images": [], "image_candidates": [], "status": "draft", "scheduled_ts": None,
+                    "telegram_message_id": None, "created_at": now_ts(), "updated_at": now_ts(),
+                    "attempts": [], "versions": [], "last_error": "", "manual_schedule": False,
+                    "style_validation_version": style_engine.STYLE_VERSION,
+                })
+            if not candidate_posts:
+                raise AnalyticsError("هیچ پست غیرخالی تولید نشد.")
+            candidate_posts = _quality_review_candidate_posts(project, source, candidate_posts)
+            source_sufficient = obj.get("source_sufficient")
+            if len(candidate_posts) > target_count:
+                raise AnalyticsError(f"تعداد پست‌ها از هدف انتخاب‌شده یعنی {target_count} بیشتر است؛ خروجی پذیرفته نشد.")
+            if len(candidate_posts) < target_count and source_sufficient is not False:
+                raise AnalyticsError(
+                    f"مدل کمتر از تعداد هدف یعنی {target_count} پست تولید کرد اما صراحتاً کمبود محتوای منبع را اعلام نکرد؛ "
+                    "خروجی برای جلوگیری از تحویل ناقص پذیرفته نشد."
+                )
+            validation = validate_post_set(candidate_posts, require_images=False)
+            if validation:
+                raise AnalyticsError("اعتبارسنجی مستقل پست‌ها ناموفق بود: " + "; ".join(validation[:4]))
+            project["posts_ai_provider"] = project.get("last_ai_provider") or project.get("ai_provider_override")
+            old = project.get("posts", [])
+            if old:
+                project.setdefault("versions", []).append({"at": now_ts(), "action": "before_regenerate_all", "posts": copy.deepcopy(old)})
+                project["versions"] = project["versions"][-50:]
+            project["posts"] = candidate_posts
+            project["split_note"] = str(obj.get("note", ""))[:500]
+            project["source_sufficient"] = obj.get("source_sufficient")
+            project["status"] = "review_posts"
+            project["approved_posts"] = False
+            project["updated_at"] = now_ts()
+            _append_history(project, "posts_generated", f"count={len(candidate_posts)}; attempt={attempt+1}")
+            return project
+        except AIUnavailableError:
+            # Service/network downtime must escape to the durable queue, not be
+            # converted into a permanent invalid-output error.
+            raise
+        except AnalyticsError as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                _rotate_project_provider_order(project)
+                continue
+    raise AnalyticsError("پس از سه تلاش با ترتیب چرخشی موتورهای فعال خروجی معتبر تولید نشد؛ انتشار مسدود ماند. " + last_error)
+
+
+def _commons_search_once(query: str, limit: int):
+    """Search Commons file namespace and resolve real imageinfo URLs."""
+    headers = {"User-Agent": "RaptorAnalytics/5.91 (Telegram analytical content bot)"}
+    search = requests.get("https://commons.wikimedia.org/w/api.php", params={
+        "action": "query", "list": "search", "srsearch": f"filetype:bitmap {query}",
+        "srnamespace": 6, "srlimit": min(10, max(1, int(limit))), "format": "json",
+    }, headers=headers, timeout=18)
+    search.raise_for_status()
+    hits = search.json().get("query", {}).get("search", [])
+    pageids = [str(x.get("pageid")) for x in hits if x.get("pageid")]
+    if not pageids:
+        return []
+    details = requests.get("https://commons.wikimedia.org/w/api.php", params={
+        "action": "query", "pageids": "|".join(pageids), "prop": "imageinfo",
+        "iiprop": "url|mime|size", "iiurlwidth": 1200, "format": "json",
+    }, headers=headers, timeout=18)
+    details.raise_for_status()
+    pages = details.json().get("query", {}).get("pages", {})
+    out, seen = [], set()
+    for page in pages.values():
+        info = (page.get("imageinfo") or [{}])[0]
+        url = info.get("thumburl") or info.get("url", "")
+        parsed = urlparse(url)
+        mime = str(info.get("mime") or "").lower()
+        if parsed.scheme != "https" or parsed.hostname != "upload.wikimedia.org":
+            continue
+        if mime not in {"image/jpeg", "image/png", "image/webp"} or url in seen:
+            continue
+        seen.add(url)
+        try:
+            check = requests.get(url, headers={**headers, "Range": "bytes=0-1023"},
+                                 stream=True, timeout=8, allow_redirects=True)
+            final = urlparse(check.url)
+            content_type = str(check.headers.get("Content-Type", "")).lower()
+            length = int(check.headers.get("Content-Length", "0") or 0)
+            accessible = (check.status_code in {200, 206} and content_type.startswith("image/")
+                          and final.scheme == "https" and final.hostname == "upload.wikimedia.org"
+                          and (not length or length <= MAX_IMAGE_BYTES))
+            check.close()
+        except Exception:
+            accessible = False
+        if not accessible:
+            continue
+        title = str(page.get("title", ""))
+        out.append({
+            "title": title, "url": url,
+            "source_url": "https://commons.wikimedia.org/wiki/" + quote_plus(title.replace(" ", "_")),
+            "mime": mime, "size": int(info.get("size", 0) or 0),
+            "license_note": "دسترسی مستقیم فایل بررسی شد؛ مجوز بازنشر باید در صفحه منبع بررسی شود.",
+            "verified_at": now_ts(), "search_query": query,
+        })
+        if len(out) >= limit:
+            break
+    return out
+
+
+def search_images(query: str, limit=5):
+    """Search real, direct Commons images using progressively broader relevant terms."""
+    raw = (query or "").strip()
+    if not raw:
+        return []
+    variants = [raw]
+    # A long model-generated query can be too restrictive. Try a compact noun phrase too.
+    compact = " ".join(re.findall(r"[\w\u0600-\u06FF-]+", raw)[:7]).strip()
+    if compact and compact.casefold() != raw.casefold():
+        variants.append(compact)
+    seen, results = set(), []
+    errors = []
+    for variant in variants:
+        try:
+            matches = _commons_search_once(variant, limit)
+            for item in matches:
+                if item.get("url") not in seen:
+                    seen.add(item.get("url"))
+                    results.append(item)
+            if len(results) >= limit:
+                break
+        except Exception as exc:
+            errors.append(type(exc).__name__)
+            log.warning("Wikimedia image search failed for query %r: %s", variant[:80], type(exc).__name__)
+    return results[:max(1, int(limit))]
+
+
+def attach_images(project: dict, limit_per_post=3):
+    """Find relevant candidates and preselect the best verified result for review.
+
+    Selection is not publication approval: posts remain drafts until an admin
+    reviews the image and explicitly approves/schedules the post.
+    """
+    total = 0
+    auto_selected = 0
+    for post in project.get("posts", []):
+        existing = {x.get("url") for x in post.get("image_candidates", []) if isinstance(x, dict)}
+        queries = [post.get("image_query"), post.get("title"), project.get("title"), project.get("topic")]
+        if len(post.get("image_candidates", [])) < limit_per_post:
+            for query in dict.fromkeys(str(q).strip() for q in queries if str(q or "").strip()):
+                matches = [x for x in search_images(query, limit_per_post)
+                           if x.get("url") and x.get("url") not in existing]
+                post.setdefault("image_candidates", []).extend(matches)
+                existing.update(x.get("url") for x in matches)
+                if len(post["image_candidates"]) >= limit_per_post:
+                    break
+        post["image_candidates"] = post.get("image_candidates", [])[:12]
+        # The first query is generated for the specific post, so the first
+        # accessible match is the default choice. Preserve manual selections.
+        if not post.get("images") and post.get("image_candidates"):
+            chosen = copy.deepcopy(post["image_candidates"][0])
+            chosen["auto_selected"] = True
+            chosen["selection_note"] = "انتخاب اولیه خودکار بر اساس عبارت تصویر همین پست؛ پیش از انتشار بازبینی شود."
+            post["images"] = [chosen]
+            post["image_auto_selected"] = True
+            auto_selected += 1
+        total += len(post.get("image_candidates", []))
+    project["updated_at"] = now_ts()
+    _append_history(project, "images_searched", f"candidate_total={total}; auto_selected={auto_selected}")
+    return total
+
+
+def validate_post_set(posts, require_images=True):
+    errors, seen = [], set()
+    if not isinstance(posts, list) or not 1 <= len(posts) <= MAX_POSTS:
+        return ["تعداد پست باید بین ۱ تا ۶ باشد؛ معمولاً ۵ تا ۶ پست لازم است."]
+    for i, post in enumerate(posts, 1):
+        text = str(post.get("text", ""))
+        body_norm = re.sub(r"\W+", "", text).casefold()
+        if not text.strip(): errors.append(f"پست {i} خالی است.")
+        if len(text) > MAX_POST_CHARS: errors.append(f"پست {i} دارای {len(text)} نویسه است؛ سقف {MAX_POST_CHARS} است.")
+        if len(text.encode("utf-16-le")) // 2 > 1024: errors.append(f"پست {i} از سقف کپشن تلگرام برحسب UTF-16 عبور کرده است.")
+        if require_images and not post.get("images") and not post.get("allow_no_image"): errors.append(f"پست {i} تصویر انتخاب‌شده ندارد.")
+        if len(post.get("images", [])) > 10: errors.append(f"پست {i} بیش از ۱۰ تصویر دارد؛ آلبوم تلگرام حداکثر ۱۰ مورد می‌پذیرد.")
+        if body_norm and body_norm in seen: errors.append(f"پست {i} تکراری است.")
+        seen.add(body_norm)
+        if not text.endswith(FOOTER): errors.append(f"پست {i} footer اجباری را ندارد.")
+        if not post.get("title"): errors.append(f"عنوان پست {i} خالی است.")
+        if post.get("style_validation_version") == style_engine.STYLE_VERSION:
+            for issue in style_engine.style_issues(_clean_body(text)):
+                errors.append(f"پست {i}: {issue}")
+        post["number"] = i
+        post["char_count"] = len(text)
+    return errors
+
+
+def validate_project_posts(project: dict, require_images=True):
+    errors = validate_post_set(project.get("posts", []), require_images=require_images)
+    # Fewer than five is acceptable only when the model explicitly noted insufficient source material.
+    if len(project.get("posts", [])) < MIN_POSTS and project.get("source_sufficient") is not False:
+        errors.append("برای مقاله کامل ۵ تا ۶ پست هدف است؛ تعداد کمتر فقط با ثبت کمبود محتوای منبع پذیرفته می‌شود.")
+    return errors
+
+
+def snapshot_post(post: dict, action: str, actor=None):
+    post.setdefault("versions", []).append({"at": now_ts(), "action": str(action)[:80],
+                                             "text": post.get("text", ""), "title": post.get("title", ""),
+                                             "images": copy.deepcopy(post.get("images", [])),
+                                             "status": post.get("status", "draft"), "actor": actor})
+    post["versions"] = post["versions"][-50:]
+
+
+def edit_post(project: dict, post_id: str, text: str, title=None, actor=None):
+    post = find_post(project, post_id)
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    if post.get("status") in {"published", "sending", "uncertain"}:
+        raise AnalyticsError("پست منتشرشده یا با نتیجه نامشخص را نمی‌توان در صف تحلیلی بازنویسی کرد؛ ابتدا نسخه/عملیات آن را بررسی کن.")
+    body = _clean_body(text)
+    final = _footer_text(body)
+    if not body: raise AnalyticsError("متن پست خالی است.")
+    if len(final) > MAX_POST_CHARS or len(final.encode("utf-16-le")) // 2 > 1024:
+        raise AnalyticsError("متن با footer از محدودیت نویسه/کپشن تلگرام عبور می‌کند.")
+    snapshot_post(post, "before_manual_edit", actor)
+    post["text"] = final
+    if title is not None: post["title"] = str(title).strip()[:140]
+    post["status"] = "needs_review"
+    post["scheduled_ts"] = None
+    post["manual_schedule"] = False
+    post["updated_at"] = now_ts()
+    project["approved_posts"] = False
+    _append_history(project, "post_edited", f"post={post_id}", actor)
+    return post
+
+
+def rewrite_post(project: dict, post_id: str, instruction: str, actor=None):
+    post = find_post(project, post_id)
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    if post.get("status") in {"published", "sending", "uncertain"}:
+        raise AnalyticsError("پست منتشرشده یا با نتیجه نامشخص قابل بازنویسی در صف نیست.")
+    prompt = (
+        style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "telegram")
+        + "\n\nفقط پست زیر را مطابق دستور مدیر بازنویسی کن. از منابع متن پروژه فراتر نرو؛ هیچ واقعیت/عدد/تاریخی نساز. "
+        "متن فارسی تلگرامی، طبیعی و مستقل باشد؛ در خروجی فقط متن پست را بده، بدون توضیح داخلی و بدون footer. "
+        "حداکثر ۹۰۰ نویسه پیش از footer.\nدستور مدیر: " + instruction +
+        "\nعنوان: " + str(post.get("title", "")) + "\nمتن فعلی:\n" + _clean_body(post.get("text", "")) +
+        "\nمتن منبع پروژه:\n" + str(project.get("article") or project.get("source_text") or "")[:18000]
+    )
+    response, _ = project_ai_call(project, prompt)
+    candidate = _footer_text(response)
+    if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
+        raise AnalyticsError("خروجی بازنویسی از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
+    if project.get("_style_quality_review", True):
+        reviewed = _quality_review_candidate_posts(
+            project,
+            str(project.get("article") or project.get("source_text") or "")[:18000],
+            [{**copy.deepcopy(post), "text": candidate, "char_count": len(candidate), "status": "draft"}],
+        )
+        candidate = reviewed[0]["text"]
+    else:
+        style_errors = style_engine.style_issues(_clean_body(candidate))
+        if style_errors:
+            raise AnalyticsError("خروجی بازنویسی با قواعد سبک سازگار نیست: " + "؛ ".join(style_errors[:5]))
+    if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
+        raise AnalyticsError("خروجی بازنویسی پس از کنترل کیفیت از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
+    snapshot_post(post, "before_ai_rewrite:" + instruction[:60], actor)
+    post["text"] = candidate
+    post["style_validation_version"] = style_engine.STYLE_VERSION
+    post["status"] = "needs_review"
+    post["scheduled_ts"] = None
+    post["manual_schedule"] = False
+    post["updated_at"] = now_ts()
+    project["approved_posts"] = False
+    _append_history(project, "post_rewritten", f"post={post_id}; instruction={instruction[:120]}", actor)
+    return post
+
+
+def find_post(project: dict, post_id: str):
+    return next((x for x in project.get("posts", []) if x.get("id") == post_id), None)
+
+
+def select_image(project: dict, post_id: str, image_index: int):
+    post = find_post(project, post_id)
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    candidates = post.get("image_candidates", [])
+    if not 0 <= int(image_index) < len(candidates): raise AnalyticsError("گزینه تصویر معتبر نیست.")
+    img = copy.deepcopy(candidates[int(image_index)])
+    snapshot_post(post, "before_image_change")
+    post["images"] = [img]
+    post["updated_at"] = now_ts()
+    project["updated_at"] = now_ts()
+    _append_history(project, "image_selected", f"post={post_id}; index={image_index}")
+    return img
+
+
+def add_project_image(project: dict, image: dict):
+    if not image or not (image.get("file_id") or image.get("url")):
+        raise AnalyticsError("تصویر فاقد file_id یا URL معتبر است.")
+    project.setdefault("images", []).append(copy.deepcopy(image))
+    project["images"] = project["images"][-60:]
+    _append_history(project, "project_image_added", f"count={len(project['images'])}")
+    return len(project["images"])
+
+
+def assign_project_image(project: dict, post_id: str, image_index: int, replace=True):
+    post = find_post(project, post_id)
+    images = project.get("images", [])
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    if not 0 <= int(image_index) < len(images): raise AnalyticsError("تصویر گالری پیدا نشد.")
+    snapshot_post(post, "before_assign_project_image")
+    item = copy.deepcopy(images[int(image_index)])
+    if replace: post["images"] = [item]
+    else: post.setdefault("images", []).append(item)
+    post["updated_at"] = now_ts()
+    _append_history(project, "project_image_assigned", f"post={post_id}; image={image_index}")
+    return post
+
+
+def remove_post_image(project: dict, post_id: str, index=0):
+    post = find_post(project, post_id)
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    images = post.get("images", [])
+    if not images: raise AnalyticsError("این پست تصویر انتخاب‌شده ندارد.")
+    if not 0 <= int(index) < len(images): raise AnalyticsError("شماره تصویر نامعتبر است.")
+    snapshot_post(post, "before_remove_image")
+    images.pop(int(index))
+    post["images"] = images
+    post["updated_at"] = now_ts()
+    return post
+
+
+def reorder_post_images(project: dict, post_id: str, order):
+    post = find_post(project, post_id)
+    if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
+    images = post.get("images", [])
+    if sorted(order) != list(range(len(images))): raise AnalyticsError("ترتیب تصاویر نامعتبر است.")
+    snapshot_post(post, "before_reorder_images")
+    post["images"] = [images[i] for i in order]
+    post["updated_at"] = now_ts()
+    return post
+
+
+def research_addendum(project: dict, request_text: str):
+    if project.get("kind") != "research": raise AnalyticsError("این قابلیت فقط برای پروژه‌های تحقیق از موضوع است.")
+    query = (request_text or project.get("topic", "")).strip()
+    results = web_search(query + " official updated report technical historical", 6)
+    if not results: raise AnalyticsError("جست‌وجوی تکمیلی نتیجه‌ای نداد؛ مقاله قبلی حفظ شد.")
+    evidence = "\n\n".join(
+        f"[{i+1}] {x['title']}\nURL: {x['url']}\nخلاصه جست‌وجو: {x.get('snippet','')}\n"
+        f"وضعیت دریافت صفحه: {x.get('fetch_status','snippet_only')}\n"
+        f"متن استخراج‌شده: {x.get('content_excerpt') or 'متن صفحه دریافت نشد؛ صرفاً خلاصه جست‌وجو موجود است.'}"
+        for i, x in enumerate(results))
+    prompt = (style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "research")
+              + "\n\nمقاله موجود را با شواهد تازه زیر تکمیل کن. متن قبلی را پاک نکن مگر آنکه دقیقاً اصلاح شود. "
+              "ادعاهای جدید را از تحلیل/برآورد جدا کن و چیزی نساز. فقط ARTICLE و SOURCES بده. "
+              f"\nدرخواست مدیر: {request_text}\nمقاله فعلی:\n{project.get('article','')}\nشواهد جدید:\n{evidence}")
+    response, raw = project_ai_call(project, prompt, use_search=True)
+    article = _split_article_sources(response)
+    if len(article) < 100: raise AnalyticsError("تحقیق تکمیلی خروجی قابل استفاده نداشت؛ مقاله قبلی حفظ شد.")
+    project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_addendum"})
+    project["article_versions"] = project["article_versions"][-50:]
+    project["article"] = article
+    project["approved_article"] = False
+    project["approved_posts"] = False
+    for old_post in project.get("posts", []):
+        if old_post.get("status") not in {"published", "sending", "uncertain"}:
+            old_post["status"] = "needs_review"
+            old_post["scheduled_ts"] = None
+            old_post["manual_schedule"] = False
+    existing = {x.get("url") for x in project.get("sources", [])}
+    project.setdefault("sources", []).extend({
+        "title": x["title"], "url": x["url"], "snippet": x.get("snippet", ""),
+        "content_excerpt": x.get("content_excerpt", ""), "fetch_status": x.get("fetch_status", "snippet_only"),
+        "search_provider": x.get("search_provider", "unknown"),
+        "fetched_at": x.get("fetched_at"), "retrieved_at": now_ts(), "status": "needs_review"
+    } for x in results if x.get("url") not in existing)
+    project["approved_article"] = False
+    project["status"] = "review_research"
+    _append_history(project, "research_updated", request_text[:160])
+    return project
+
+
+def _epoch(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+    return None
+
+
+def news_times(state: dict, day_start: float, day_end: float):
+    """Read-only extraction of fixed news times. Never edits news queue/history."""
+    times = []
+    for item in state.get("_pending_queue", []):
+        if item.get("delivery_status") in {"uncertain", "partial", "sending", "sent"}:
+            continue
+        ts = _epoch(item.get("scheduled_at") or item.get("scheduled_ts") or item.get("publish_at"))
+        if ts is not None and day_start <= ts <= day_end:
+            times.append(ts)
+    for item in state.get("_published_history", []):
+        ts = _epoch(item.get("ts") or item.get("published_ts") or item.get("published_at"))
+        if ts is not None and day_start <= ts <= day_end:
+            times.append(ts)
+    return sorted(set(times))
+
+
+def forecast_news_times(state: dict, day_start: float, day_end: float, tzinfo):
+    """Project the bot's configured news cadence for planning only; these are not actual news IDs.
+
+    Exact scheduled_at/published times are always included separately. Forecast slots let the
+    analytics planner reserve likely news gaps while the news engine itself remains untouched.
+    A new actual news publication is checked again at runtime and can move only auto-scheduled
+    analytics posts.
+    """
+    settings = state.get("_admin_settings", {}) if isinstance(state.get("_admin_settings"), dict) else {}
+    start_hour = max(0, min(23, int(settings.get("active_start_hour", 8) or 8)))
+    afternoon = max(start_hour, min(23, int(settings.get("afternoon_start_hour", 14) or 14)))
+    end_hour = max(1, min(24, int(settings.get("active_end_hour", 24) or 24)))
+    morning_gap = max(5, int(settings.get("morning_spacing_minutes", 60) or 60)) * 60
+    afternoon_gap = max(5, int(settings.get("afternoon_spacing_minutes", 45) or 45)) * 60
+    first_day = datetime.fromtimestamp(day_start, tzinfo).date()
+    last_day = datetime.fromtimestamp(day_end, tzinfo).date()
+    slots = []
+    d = first_day
+    while d <= last_day:
+        begin = datetime(d.year, d.month, d.day, start_hour, 0, tzinfo=tzinfo)
+        split = datetime(d.year, d.month, d.day, afternoon, 0, tzinfo=tzinfo)
+        finish = datetime(d.year, d.month, d.day, 0, 0, tzinfo=tzinfo) + timedelta(days=1)
+        cursor = begin
+        while cursor < finish:
+            if cursor.hour < start_hour or cursor.hour >= end_hour:
+                break
+            gap = morning_gap if cursor < split else afternoon_gap
+            ts = cursor.timestamp()
+            if day_start <= ts <= day_end:
+                slots.append(ts)
+            cursor += timedelta(seconds=gap)
+        d += timedelta(days=1)
+    return slots
+
+
+def planning_news_times(state: dict, day_start: float, day_end: float, tzinfo):
+    actual = news_times(state, day_start, day_end)
+    forecasts = forecast_news_times(state, day_start, day_end, tzinfo)
+    # Exact schedule is authoritative; merging equal/near times as one slot avoids fake duplicate gaps.
+    merged = sorted(actual + forecasts)
+    result = []
+    for ts in merged:
+        if not result or abs(ts - result[-1]) >= 5 * 60:
+            result.append(ts)
+        elif ts in actual:
+            result[-1] = ts
+    return result
+
+def _other_analytics_times(a: dict, except_pid: str, day_start: float, day_end: float):
+    times = []
+    for other in a.get("projects", {}).values():
+        if other.get("id") == except_pid:
+            continue
+        for post in other.get("posts", []):
+            if post.get("status") in {"scheduled", "sending", "uncertain", "published"}:
+                ts = _epoch(post.get("scheduled_ts") or post.get("published_at"))
+                if ts is not None and day_start <= ts <= day_end:
+                    times.append(ts)
+    return times
+
+
+def _check_candidate(ts, news, analytic, gap):
+    conflicts = [x for x in list(news) + list(analytic) if abs(float(x) - float(ts)) < gap]
+    return not conflicts
+
+
+def propose_project_schedule(state: dict, project: dict, tzinfo):
+    """Assign the earliest feasible schedule; mutate analytics records only."""
+    a = ensure_state(state); settings = a["settings"]
+    if settings.get("schedule_mode", "auto") != "auto":
+        raise AnalyticsError("زمان‌بندی دستی فعال است.")
+    if not project.get("approved_posts"):
+        raise AnalyticsError("پست‌ها هنوز تأیید نهایی مدیر را نگرفته‌اند.")
+    errors = validate_project_posts(project, settings.get("require_image", True))
+    if errors: raise AnalyticsError("پست‌ها قابل زمان‌بندی نیستند: " + "؛ ".join(errors[:8]))
+    all_posts = project.get("posts", [])
+    active_posts = [p for p in all_posts if p.get("status") not in {"published", "cancelled", "rejected", "archived"}]
+    if not active_posts:
+        raise AnalyticsError("تمام پست‌های این پروژه قبلاً منتشر شده‌اند.")
+    start_hour, end_hour = int(settings.get("start_hour", 14)), int(settings.get("end_hour", 21))
+    gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
+    now = datetime.now(tzinfo)
+    scheduled_projects = set()
+    for other in a["projects"].values():
+        if other.get("id") == project.get("id"):
+            continue
+        for other_post in other.get("posts", []):
+            if other_post.get("status") not in {"scheduled", "published", "sending", "uncertain"}:
+                continue
+            other_ts = _epoch(other_post.get("scheduled_ts") or other_post.get("published_at"))
+            if other_ts:
+                scheduled_projects.add(datetime.fromtimestamp(other_ts, tzinfo).date().isoformat())
+    for day_offset in range(0, 366):
+        day = (now + timedelta(days=day_offset)).date(); day_key = day.isoformat()
+        if day_key in scheduled_projects: continue
+        begin = datetime(day.year, day.month, day.day, start_hour, 0, tzinfo=tzinfo)
+        end = datetime(day.year, day.month, day.day, end_hour, 0, tzinfo=tzinfo)
+        cursor = max(begin, now + timedelta(minutes=1))
+        if cursor >= end: continue
+        day_start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=tzinfo).timestamp()
+        day_end = day_start + 86400
+        news = planning_news_times(state, begin.timestamp() - gap, end.timestamp() + gap, tzinfo)
+        other_analytic = _other_analytics_times(a, project.get("id"), day_start - gap, day_end + gap)
+        published_today = []
+        for post in all_posts:
+            if post.get("status") != "published": continue
+            published_ts = _epoch(post.get("published_at"))
+            if published_ts and day_start <= published_ts <= day_end:
+                published_today.append(published_ts)
+        assigned = sorted(published_today)
+        candidates = []
+        feasible = True
+        prev_analytic = assigned[-1] if assigned else None
+        for index, post in enumerate(active_posts):
+            candidate = cursor
+            needs_news_before = prev_analytic is not None
+            if needs_news_before:
+                next_news = [x for x in news if x >= prev_analytic + gap and x < end.timestamp()]
+                if not next_news:
+                    feasible = False; break
+                candidate = max(candidate, datetime.fromtimestamp(next_news[0] + gap, tz=tzinfo))
+            while candidate < end:
+                ts = candidate.timestamp()
+                conflicts = [x for x in news + other_analytic + assigned + candidates if abs(x - ts) < gap]
+                if not conflicts: break
+                candidate = datetime.fromtimestamp(max(conflicts) + gap, tz=tzinfo)
+            if candidate >= end:
+                feasible = False; break
+            ts = candidate.timestamp()
+            if prev_analytic is not None and not any(prev_analytic < n < ts for n in news):
+                feasible = False; break
+            candidates.append(ts); prev_analytic = ts; cursor = candidate + timedelta(minutes=1)
+        if feasible:
+            for post, ts in zip(active_posts, candidates):
+                if post.get("status") in {"sending", "uncertain"}:
+                    raise AnalyticsError("پروژه دارای ارسال نامشخص است؛ زمان‌بندی خودکار متوقف شد.")
+                post["scheduled_ts"] = ts; post["status"] = "scheduled"; post["manual_schedule"] = False
+                post["updated_at"] = now_ts()
+            project["publish_day"] = day_key; project["schedule_mode"] = "auto"
+            project["status"] = "scheduled"; project["updated_at"] = now_ts()
+            _append_history(project, "schedule_auto", day_key + f"; posts={len(active_posts)}")
+            return candidates
+    raise AnalyticsError("در ۳۶۵ روز آینده زمان خالی مطابق محدودیت‌ها پیدا نشد؛ صف تحلیلی حفظ شد و صف اخبار تغییر نکرد.")
+
+def suggest_manual_schedule_times(state: dict, project: dict, post: dict, around_ts: float,
+                                   tzinfo, limit: int = 5, days: int = 7) -> list[float]:
+    """Find nearby valid alternatives by running the exact manual-schedule validator on copies."""
+    if not project or not post:
+        return []
+    anchor = datetime.fromtimestamp(float(around_ts), tzinfo)
+    start_hour = int(ensure_state(state)["settings"].get("start_hour", 14))
+    end_hour = int(ensure_state(state)["settings"].get("end_hour", 21))
+    start_day = anchor.date()
+    candidates = []
+    for day_offset in range(0, max(1, min(14, int(days)))):
+        day = start_day + timedelta(days=day_offset)
+        for hour in range(start_hour, end_hour + 1):
+            for minute in (0, 15, 30, 45):
+                if hour == end_hour and minute:
+                    continue
+                dt = datetime(day.year, day.month, day.day, hour, minute, tzinfo=tzinfo)
+                stamp = dt.timestamp()
+                if stamp <= now_ts() + 60:
+                    continue
+                if day_offset == 0 and abs(stamp - float(around_ts)) < 15 * 60:
+                    continue
+                candidates.append(stamp)
+    candidates.sort(key=lambda ts: (abs(ts - float(around_ts)), ts))
+    valid = []
+    for stamp in candidates:
+        clone = copy.deepcopy(state)
+        clone_a = ensure_state(clone)
+        clone_project = clone_a["projects"].get(str(project.get("id")))
+        clone_post = find_post(clone_project, str(post.get("id"))) if clone_project else None
+        if not clone_project or not clone_post:
+            continue
+        try:
+            manual_schedule_single(clone, clone_project, clone_post, stamp, tzinfo)
+            valid.append(stamp)
+            if len(valid) >= max(1, min(8, int(limit))):
+                break
+        except AnalyticsError:
+            continue
+    return sorted(valid)
+
+
+def propose_manual_schedule(state: dict, project: dict, timestamps, tzinfo):
+    """Validate all manual timestamps atomically before mutating project posts."""
+    a = ensure_state(state); settings = a["settings"]
+    posts = project.get("posts", [])
+    if not project.get("approved_posts"): raise AnalyticsError("پست‌ها باید پیش از زمان‌بندی دستی تأیید شوند.")
+    errors = validate_project_posts(project, settings.get("require_image", True))
+    if errors: raise AnalyticsError("پست‌ها قابل زمان‌بندی نیستند: " + "; ".join(errors[:8]))
+    if len(timestamps) != len(posts): raise AnalyticsError(f"باید دقیقاً {len(posts)} زمان وارد کنی.")
+    values = [float(x) for x in timestamps]
+    local = [datetime.fromtimestamp(x, tzinfo) for x in values]
+    if values != sorted(values) or len(set(values)) != len(values): raise AnalyticsError("زمان‌ها باید یکتا و به ترتیب صعودی باشند.")
+    start, end = int(settings.get("start_hour", 14)), int(settings.get("end_hour", 21))
+    for dt in local:
+        if dt.hour < start or dt.hour > end or (dt.hour == end and (dt.minute or dt.second)):
+            raise AnalyticsError(f"تمام زمان‌ها باید در بازه {start:02d}:00 تا {end:02d}:00 باشند.")
+    gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
+    begin = min(datetime(x.year,x.month,x.day,0,0,tzinfo=tzinfo).timestamp() for x in local) - gap
+    finish = max(datetime(x.year,x.month,x.day,23,59,tzinfo=tzinfo).timestamp() for x in local) + gap
+    news = planning_news_times(state, begin, finish, tzinfo)
+    other = _other_analytics_times(a, project.get("id"), begin, finish)
+    if any(not _check_candidate(ts, news, other, gap) for ts in values):
+        raise AnalyticsError("حداقل یکی از زمان‌ها با خبر یا پست تحلیلی دیگر کمتر از ۲۰ دقیقه فاصله دارد.")
+    for i in range(1, len(values)):
+        if not any(values[i-1] < n < values[i] for n in news):
+            raise AnalyticsError(f"بین پست {i} و {i+1} باید حداقل یک خبر قرار بگیرد.")
+    day_keys = {x.date().isoformat() for x in local}
+    # The stated rule is one project per day, not one project per timestamp.
+    for other_pid, other_project in a["projects"].items():
+        if other_pid == project.get("id"): continue
+        for op in other_project.get("posts", []):
+            if op.get("status") not in {"scheduled", "sending", "uncertain", "published"}: continue
+            other_ts = _epoch(op.get("scheduled_ts") or op.get("published_at"))
+            if other_ts and datetime.fromtimestamp(other_ts, tzinfo).date().isoformat() in day_keys:
+                raise AnalyticsError("در یکی از روزهای انتخاب‌شده پروژه تحلیلی دیگری فعال است؛ قانون یک پروژه در روز رعایت نمی‌شود.")
+    # Atomic mutation only after all checks pass.
+    for post, ts in zip(posts, values):
+        if post.get("status") in {"published", "sending", "uncertain"}:
+            raise AnalyticsError("پستی منتشر شده یا دارای نتیجه نامشخص است؛ زمان‌بندی مجدد کل پروژه مجاز نیست.")
+    for post, ts in zip(posts, values):
+        post["scheduled_ts"] = ts; post["status"] = "scheduled"; post["manual_schedule"] = True; post["updated_at"] = now_ts()
+    project["publish_day"] = local[0].date().isoformat() if len(day_keys) == 1 else ",".join(sorted(day_keys))
+    project["schedule_mode"] = "manual"; project["status"] = "scheduled"; project["updated_at"] = now_ts()
+    _append_history(project, "schedule_manual", ",".join(datetime.fromtimestamp(x,tzinfo).strftime("%Y-%m-%d %H:%M") for x in values))
+    return values
+
+
+def manual_schedule_single(state: dict, project: dict, post: dict, ts: float, tzinfo):
+    a = ensure_state(state); settings = a["settings"]
+    if not project.get("approved_posts"):
+        raise AnalyticsError("پست باید تأیید شده باشد.")
+    if post.get("status") in {"published", "sending", "uncertain"}:
+        raise AnalyticsError("وضعیت پست اجازه تغییر زمان نمی‌دهد.")
+    local = datetime.fromtimestamp(float(ts), tzinfo)
+    start, end = int(settings.get("start_hour", 14)), int(settings.get("end_hour", 21))
+    if local.hour < start or local.hour > end or (local.hour == end and (local.minute or local.second)):
+        raise AnalyticsError("زمان باید داخل بازه تحلیلی باشد.")
+    gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
+    news = planning_news_times(state, ts-gap, ts+gap, tzinfo)
+    if any(abs(n-ts) < gap for n in news):
+        raise AnalyticsError("زمان پیشنهادی با زمان خبر/پنجره پیش‌بینی‌شده کمتر از ۲۰ دقیقه فاصله دارد.")
+    # Other projects may not occupy this local day. The selected project may have multiple posts
+    # on the day, but their order, 20-minute spacing, and an intervening news slot remain mandatory.
+    day_key = local.date().isoformat()
+    for pid, other_project in a["projects"].items():
+        if pid == project.get("id"):
+            continue
+        for other_post in other_project.get("posts", []):
+            if other_post.get("status") not in {"scheduled", "published", "sending", "uncertain"}:
+                continue
+            other_ts = _epoch(other_post.get("scheduled_ts") or other_post.get("published_at"))
+            if other_ts and datetime.fromtimestamp(other_ts, tzinfo).date().isoformat() == day_key:
+                raise AnalyticsError("در این روز پروژه تحلیلی دیگری برنامه‌ریزی شده است.")
+    related = []
+    for other_post in project.get("posts", []):
+        if other_post.get("id") == post.get("id") or other_post.get("status") not in {"scheduled", "published", "sending", "uncertain"}:
+            continue
+        other_ts = _epoch(other_post.get("scheduled_ts") or other_post.get("published_at"))
+        if other_ts is None:
+            continue
+        if abs(other_ts - ts) < gap:
+            raise AnalyticsError("زمان با پست تحلیلی دیگری از همین پروژه کمتر از ۲۰ دقیقه فاصله دارد.")
+        related.append((other_ts, other_post))
+    # Preserve sequence across calendar days too: post N must remain after all scheduled
+    # lower-numbered posts and before all higher-numbered posts.
+    current_number = int(post.get("number", 0))
+    prior = [(t, p) for t, p in related if int(p.get("number", 0)) < current_number]
+    later = [(t, p) for t, p in related if int(p.get("number", 0)) > current_number]
+    if any(t >= ts for t, _ in prior):
+        raise AnalyticsError("ترتیب انتشار پروژه رعایت نشده است؛ این پست باید بعد از تمام پست‌های قبلی باشد.")
+    if any(t <= ts for t, _ in later):
+        raise AnalyticsError("ترتیب انتشار پروژه رعایت نشده است؛ این پست باید قبل از تمام پست‌های بعدی باشد.")
+    if prior:
+        prev_ts = max(prior, key=lambda pair: int(pair[1].get("number", 0)))[0]
+        interval_news = planning_news_times(state, prev_ts, ts, tzinfo)
+        if not any(prev_ts < n < ts for n in interval_news):
+            raise AnalyticsError("بین پست قبلی همین پروژه و زمان جدید باید یک خبر قرار بگیرد.")
+    if later:
+        next_ts = min(later, key=lambda pair: int(pair[1].get("number", 0)))[0]
+        interval_news = planning_news_times(state, ts, next_ts, tzinfo)
+        if not any(ts < n < next_ts for n in interval_news):
+            raise AnalyticsError("بین زمان جدید و پست بعدی همین پروژه باید یک خبر قرار بگیرد.")
+    post["scheduled_ts"] = float(ts); post["manual_schedule"] = True; post["status"] = "scheduled"; post["updated_at"] = now_ts()
+    day_keys = sorted({datetime.fromtimestamp(_epoch(p.get("scheduled_ts") or p.get("published_at")), tzinfo).date().isoformat()
+                       for p in project.get("posts", []) if p.get("status") in {"scheduled", "published", "sending", "uncertain"}
+                       and _epoch(p.get("scheduled_ts") or p.get("published_at"))})
+    project["schedule_mode"] = "manual"; project["publish_day"] = ",".join(day_keys) or day_key
+    project["status"] = "scheduled"; project["updated_at"] = now_ts()
+    _append_history(project, "post_rescheduled_manual", f"post={post.get('id')}; at={day_key} {local:%H:%M}")
+    return post
+
+def due_posts(state: dict, now=None):
+    a = ensure_state(state); now = now or now_ts()
+    if a["settings"].get("paused"): return []
+    due = []
+    for project in a["projects"].values():
+        if project.get("archived") or project.get("paused") or project.get("status") == "cancelled": continue
+        for post in project.get("posts", []):
+            if post.get("status") == "scheduled" and post.get("scheduled_ts") and float(post["scheduled_ts"]) <= now:
+                due.append((project, post))
+    return sorted(due, key=lambda pair: pair[1].get("scheduled_ts") or 0)
+
+
+def mark_sending(project: dict, post: dict):
+    post["status"] = "sending"
+    post.setdefault("attempts", []).append({"started_at": now_ts(), "status": "sending", "scheduled_ts": post.get("scheduled_ts")})
+    project["status"] = "publishing"; project["updated_at"] = now_ts()
+    _append_history(project, "post_send_started", str(post.get("id")))
+
+
+def mark_uncertain(project: dict, post: dict, error: str):
+    post["status"] = "uncertain"; post["last_error"] = str(error)[:500]
+    if post.get("attempts"):
+        post["attempts"][-1].update({"status": "uncertain", "error": str(error)[:500], "ended_at": now_ts()})
+    project["status"] = "error"; project["last_error"] = str(error)[:500]; project["updated_at"] = now_ts()
+    _append_history(project, "post_send_uncertain", f"post={post.get('id')}; {error[:200]}")
+
+
+def mark_published(project: dict, post: dict, message_id):
+    post["status"] = "published"; post["telegram_message_id"] = message_id; post["published_at"] = now_ts(); post["last_error"] = ""
+    if post.get("attempts"):
+        post["attempts"][-1].update({"status": "published", "message_id": message_id, "ended_at": now_ts()})
+    terminal = {"published", "rejected", "cancelled", "archived"}
+    project["status"] = "completed" if project.get("posts") and all(x.get("status") in terminal for x in project.get("posts", [])) else "scheduled"
+    project["updated_at"] = now_ts()
+    _append_history(project, "post_published", f"post={post.get('id')}; message_id={message_id}")
+
+
+def render_metrics(state: dict):
+    a = ensure_state(state)
+    projects = list(a["projects"].values())
+    posts = [p for pr in projects for p in pr.get("posts", [])]
+    return {
+        "projects": len(projects), "active_projects": sum(not p.get("archived") and p.get("status") not in {"completed","cancelled","rejected"} for p in projects),
+        "posts": len(posts), "draft": sum(p.get("status") in {"draft","needs_review"} for p in posts),
+        "scheduled": sum(p.get("status") == "scheduled" for p in posts),
+        "published": sum(p.get("status") == "published" for p in posts),
+        "failed_or_uncertain": sum(p.get("status") in {"failed","uncertain","error"} for p in posts),
+        "images_missing": sum(not p.get("images") for p in posts if p.get("status") not in {"cancelled","archived"}),
+        "paused": bool(a["settings"].get("paused")),
+    }
+
+
+def archive_project(project: dict):
+    if any(p.get("status") in {"sending", "uncertain"} for p in project.get("posts", [])):
+        raise AnalyticsError("ابتدا وضعیت ارسال‌های در حال انجام/نامشخص را بررسی کن.")
+    for post in project.get("posts", []):
+        if post.get("status") not in {"published", "cancelled"}:
+            post["status"] = "archived"; post["scheduled_ts"] = None
+    project["archived"] = True; project["status"] = "archived"; project["updated_at"] = now_ts()
+    _append_history(project, "project_archived")
+    return project
+
+
+def cancel_project(project: dict):
+    if any(p.get("status") in {"sending", "uncertain"} for p in project.get("posts", [])):
+        raise AnalyticsError("پروژه دارای ارسال در حال انجام یا نتیجه نامشخص است؛ برای جلوگیری از تکرار، ابتدا بررسی دستی لازم است.")
+    project["status"] = "cancelled"
+    for post in project.get("posts", []):
+        if post.get("status") != "published":
+            post["status"] = "cancelled"; post["scheduled_ts"] = None
+    project["updated_at"] = now_ts(); _append_history(project, "project_cancelled")
+    return project

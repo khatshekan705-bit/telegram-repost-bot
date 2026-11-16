@@ -8,7 +8,7 @@ from __future__ import annotations
 import re
 from typing import Iterable
 
-STYLE_VERSION = "5.91"
+STYLE_VERSION = "5.92"
 MAX_CUSTOM_INSTRUCTIONS = 12000
 
 # The user's saved terminology preferences are enforced mechanically after generation.

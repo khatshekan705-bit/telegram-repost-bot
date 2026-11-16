@@ -1,4 +1,4 @@
-"""Raptor V5.91 independent analytical-content subsystem.
+"""Raptor V5.92 independent analytical-content subsystem.
 
 All analytics records live under state['_analytics']; news queue/configuration is read-only.
 Analytical research automatically rotates through enabled Gemini, Groq and Mistral providers.
@@ -7,6 +7,7 @@ No operation publishes without explicit post approval and image validation.
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import json
 import logging
@@ -29,7 +30,7 @@ MIN_POSTS = 5
 MAX_POSTS = 6
 MAX_IMAGE_BYTES = 10 * 1024 * 1024
 DEFAULT_TZ = "Asia/Tehran"
-SCHEMA_VERSION = 5
+SCHEMA_VERSION = 7
 
 class AnalyticsError(RuntimeError):
     """Expected user-facing analytics error."""
@@ -51,6 +52,7 @@ def _default_settings() -> dict:
         "require_image": True, "target_chat_id": os.getenv("ANALYTICS_TARGET_CHAT_ID", os.getenv("TARGET_CHAT_ID", "")).strip(),
         "auto_reschedule": True, "daily_project_limit": 1,
         "default_post_count": 6, "default_tone": "تحلیلی، طبیعی و گفت‌وگومحور",
+        "image_storage_dir": os.getenv("ANALYTICS_IMAGE_DIR", "/data/analytics_media" if os.path.isdir("/data") else "analytics_media"),
         "custom_writing_instructions": "", "style_profile_version": style_engine.STYLE_VERSION,
         "style_quality_review": True,
         # Analytical research is autonomous by default: all enabled providers are tried,
@@ -83,6 +85,11 @@ def ensure_state(state: dict) -> dict:
     a["settings"].setdefault("custom_writing_instructions", "")
     a["settings"].setdefault("style_profile_version", style_engine.STYLE_VERSION)
     a["settings"].setdefault("style_quality_review", True)
+    if previous_schema < 7:
+        a["settings"]["start_hour"] = 14
+        a["settings"]["end_hour"] = 21
+        a["settings"]["daily_project_limit"] = 1
+        a["settings"]["schedule_window_migrated_v592"] = True
     # Never discard manager instructions during migration; only cap oversized payloads.
     a["settings"]["custom_writing_instructions"] = str(a["settings"].get("custom_writing_instructions", ""))[:style_engine.MAX_CUSTOM_INSTRUCTIONS]
     a.setdefault("history", [])
@@ -334,7 +341,7 @@ def project_ai_call(project: dict, prompt: str, *, use_search=False, timeout=90)
 def enqueue_ai_task(state: dict, project_id: str, operation: str, *, args=None, owner_id=None, error="") -> dict:
     """Persist a retryable analytical AI task without altering news queues."""
     a = ensure_state(state)
-    valid_operations = {"research", "split"}
+    valid_operations = {"research", "split", "research_continue"}
     if operation not in valid_operations:
         raise AnalyticsError("نوع کار صف هوش مصنوعی تحلیلی پشتیبانی نمی‌شود.")
     project = a["projects"].get(str(project_id))
@@ -381,7 +388,7 @@ def _search_url_from_ddg(href: str) -> str:
 def _search_ddg(query: str, limit: int):
     r = requests.get(
         "https://html.duckduckgo.com/html/", params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.92)"}, timeout=18,
     )
     r.raise_for_status()
     from bs4 import BeautifulSoup
@@ -410,7 +417,7 @@ def _search_bing_rss(query: str, limit: int):
     import xml.etree.ElementTree as ET
     r = requests.get(
         "https://www.bing.com/search", params={"q": query, "format": "rss"},
-        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.91)"}, timeout=18,
+        headers={"User-Agent": "Mozilla/5.0 (compatible; RaptorAnalytics/5.92)"}, timeout=18,
     )
     r.raise_for_status()
     root = ET.fromstring(r.text)
@@ -434,7 +441,7 @@ def _search_wikipedia(query: str, limit: int):
         "https://en.wikipedia.org/w/api.php",
         params={"action": "query", "list": "search", "srsearch": query,
                 "srlimit": min(8, max(1, limit)), "format": "json", "utf8": 1},
-        headers={"User-Agent": "RaptorAnalytics/5.91 (research bot)"}, timeout=15,
+        headers={"User-Agent": "RaptorAnalytics/5.92 (research bot)"}, timeout=15,
     )
     r.raise_for_status()
     rows = r.json().get("query", {}).get("search", [])
@@ -569,53 +576,164 @@ def _split_article_sources(text: str):
     return article
 
 
+def _checkpoint_project(project: dict) -> None:
+    """Persist the current project checkpoint when the queue worker provides a callback."""
+    callback = project.pop("_persist_callback", None)
+    if callable(callback):
+        try:
+            callback()
+        finally:
+            project["_persist_callback"] = callback
+
+
+def _default_research_axes(topic: str) -> list[dict]:
+    return [
+        {"id": "background", "title": "تاریخچه و زمینه توسعه", "query": topic + " history development timeline"},
+        {"id": "architecture", "title": "ساختار، اجزا و شیوه عملکرد", "query": topic + " technical architecture components operation"},
+        {"id": "capabilities", "title": "قابلیت‌ها، محدودیت‌ها و مقایسه", "query": topic + " capabilities limitations comparison official"},
+        {"id": "current", "title": "وضعیت و تحولات به‌روز", "query": topic + " latest current status official"},
+    ]
+
+
 def research_project(project: dict):
-    topic = project.get("topic", "").strip()
+    """Multi-stage research with durable plan, per-axis evidence and analysis checkpoints."""
+    topic = str(project.get("topic", "")).strip()
     if not topic:
         raise AnalyticsError("موضوع تحقیق خالی است.")
-    results = web_search(topic, 8)
-    if len(results) < 3:
-        raise AnalyticsError(f"جست‌وجوی وب فقط {len(results)} نتیجه قابل استفاده داد؛ حداقل ۳ نتیجه لازم است تا تحقیق ضعیف به مقاله تبدیل نشود.")
-    sources = [{"title": x["title"], "url": x["url"], "snippet": x["snippet"],
-                "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review",
-                "search_provider": x.get("search_provider", "unknown"),
+    workflow = project.setdefault("research_workflow", {})
+    workflow.setdefault("stage", "planning")
+    workflow.setdefault("axes", [])
+    workflow.setdefault("axis_results", {})
+    workflow.setdefault("axis_analysis", {})
+    workflow.setdefault("contradictions", [])
+    workflow.setdefault("information_gaps", [])
+    workflow.setdefault("started_at", now_ts())
+
+    # Stage 1: split broad subjects into discrete research axes only once.
+    if not workflow.get("axes"):
+        plan_prompt = (
+            "موضوع تحقیق را به ۳ تا ۵ محور پژوهشی مستقل و غیرتکراری تقسیم کن. "
+            "محورها باید متناسب با موضوع باشند؛ برای موضوع تاریخی، خط زمانی و زمینه تاریخی؛ "
+            "برای موضوع فنی، معماری، اجزا، عملکرد، قابلیت و محدودیت؛ و برای موضوع روز، وضعیت فعلی را پوشش بده. "
+            "خروجی فقط JSON معتبر با ساختار {\"axes\":[{\"id\":\"...\",\"title\":\"...\",\"query\":\"عبارت جست‌وجوی مناسب انگلیسی یا فارسی\"}]} باشد. "
+            "از محورهای عمومی و غیرمرتبط خودداری کن.\nموضوع: " + topic
+        )
+        try:
+            raw_plan, _ = project_ai_call(project, plan_prompt)
+            plan = _json_from_model(raw_plan)
+            raw_axes = plan.get("axes", [])
+            axes = []
+            for index, item in enumerate(raw_axes[:5], 1):
+                if not isinstance(item, dict):
+                    continue
+                title = str(item.get("title", "")).strip()[:120]
+                query = str(item.get("query", "")).strip()[:300]
+                if title and query:
+                    axes.append({"id": re.sub(r"[^a-zA-Z0-9_-]", "", str(item.get("id") or f"axis{index}"))[:30] or f"axis{index}",
+                                 "title": title, "query": query})
+            workflow["axes"] = axes or _default_research_axes(topic)
+            workflow["plan_provider"] = project.get("last_ai_provider", "unknown")
+        except AIUnavailableError:
+            raise
+        except Exception:
+            # Invalid planner JSON must not lose the project; use a deterministic topic-aware fallback.
+            workflow["axes"] = _default_research_axes(topic)
+            workflow["plan_provider"] = "rule_based_fallback"
+        workflow["stage"] = "collecting_evidence"
+        workflow["planned_at"] = now_ts()
+        _checkpoint_project(project)
+
+    # Stage 2: search and analyze each axis independently. Completed axes are never repeated.
+    for axis in workflow["axes"]:
+        axis_id = axis["id"]
+        if axis_id not in workflow["axis_results"]:
+            results = web_search(str(axis.get("query") or topic), 6)
+            records = [{
+                "title": x.get("title", ""), "url": x.get("url", ""),
+                "snippet": x.get("snippet", ""), "retrieved_at": x.get("retrieved_at", now_ts()),
+                "status": "needs_review", "search_provider": x.get("search_provider", "unknown"),
                 "content_excerpt": x.get("content_excerpt", ""),
                 "fetch_status": x.get("fetch_status", "snippet_only"),
-                "fetched_at": x.get("fetched_at")} for x in results]
-    evidence = "\n\n".join(
-        f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه جست‌وجو: {s['snippet']}\n"
-        f"وضعیت دریافت صفحه: {s.get('fetch_status', 'snippet_only')}\nمتن استخراج‌شده از صفحه: {s.get('content_excerpt') or 'متن کامل صفحه دریافت نشد؛ فقط خلاصه جست‌وجو موجود است.'}"
-        for i, s in enumerate(sources))
+                "fetched_at": x.get("fetched_at"), "research_axis": axis.get("title", ""),
+            } for x in results]
+            workflow["axis_results"][axis_id] = records
+            workflow["axis_status"] = workflow.get("axis_status", {})
+            workflow["axis_status"][axis_id] = "evidence_collected"
+            workflow["last_completed_axis"] = axis_id
+            workflow["stage"] = "analyzing_evidence"
+            _checkpoint_project(project)
+
+        if axis_id not in workflow["axis_analysis"]:
+            records = workflow["axis_results"].get(axis_id, [])
+            evidence = "\n\n".join(
+                f"[{i+1}] {r['title']}\nURL: {r['url']}\nخلاصه: {r.get('snippet','')}\n"
+                f"متن صفحه: {r.get('content_excerpt') or 'متن کامل صفحه دریافت نشد.'}"
+                for i, r in enumerate(records)
+            )
+            axis_prompt = (
+                "شواهد این محور تحقیق را تحلیل کن. ادعاهای اصلی، میزان اطمینان، اختلاف میان منابع، "
+                "اطلاعات ناکافی و تاریخ‌های مهم را جدا کن. هیچ واقعیت جدیدی نساز. "
+                "خروجی فقط JSON معتبر باشد: {\"summary\":\"...\",\"claims\":[...],"
+                "\"contradictions\":[...],\"gaps\":[...],\"freshness_notes\":[...]}. "
+                f"\nموضوع کلان: {topic}\nمحور: {axis.get('title')}\nشواهد:\n{evidence}"
+            )
+            try:
+                raw_analysis, _ = project_ai_call(project, axis_prompt)
+                try:
+                    analysis = _json_from_model(raw_analysis)
+                except AnalyticsError:
+                    analysis = {"summary": raw_analysis[:6000], "claims": [], "contradictions": [], "gaps": [], "freshness_notes": []}
+            except AIUnavailableError:
+                raise
+            workflow["axis_analysis"][axis_id] = analysis
+            workflow["axis_status"][axis_id] = "analyzed"
+            workflow["contradictions"].extend(str(x)[:700] for x in analysis.get("contradictions", []) if x)
+            workflow["information_gaps"].extend(str(x)[:700] for x in analysis.get("gaps", []) if x)
+            _checkpoint_project(project)
+
+    # Stage 3: consolidate the dossier and compose the article after all axis checkpoints exist.
+    all_sources, known = [], set()
+    dossier_parts = []
+    for axis in workflow["axes"]:
+        axis_id = axis["id"]
+        for source in workflow["axis_results"].get(axis_id, []):
+            if source.get("url") and source["url"] not in known:
+                known.add(source["url"])
+                all_sources.append(source)
+        dossier_parts.append(
+            f"محور: {axis.get('title')}\nتحلیل محور:\n" + json.dumps(workflow["axis_analysis"].get(axis_id, {}), ensure_ascii=False)
+        )
+    if len(all_sources) < 3:
+        raise AIUnavailableError("پرونده تحقیق هنوز حداقل سه منبع قابل بررسی ندارد؛ پروژه در صف باقی می‌ماند.")
+    workflow["stage"] = "composing_article"
+    _checkpoint_project(project)
     custom_style = str(project.get("_style_custom_instructions", ""))
+    sources_evidence = "\n\n".join(
+        f"[{i+1}] {s['title']}\nURL: {s['url']}\nخلاصه: {s.get('snippet','')}\n"
+        f"تاریخ دریافت: {datetime.fromtimestamp(float(s.get('retrieved_at') or now_ts()), timezone.utc).isoformat()}\n"
+        f"وضعیت دریافت صفحه: {s.get('fetch_status','snippet_only')}\nمتن صفحه: {s.get('content_excerpt') or 'متن صفحه دریافت نشد؛ به خلاصه محدود بمان.'}"
+        for i, s in enumerate(all_sources)
+    )
     prompt = (
         style_engine.build_style_prompt(custom_style, "research")
-        + "\n\nنقش: پژوهشگر و نویسنده فارسی‌زبان. از نتایج جست‌وجوی واقعی پیوست و در صورت نیاز Google Search grounding استفاده کن. "
-        "منابع را در گزارش مدیریتی جدا کن؛ نام منابع/مستندات، فهرست منبع و هیچ URL را داخل ARTICLE نیاور و فقط در SOURCES ثبت کن. "
-        "هیچ عدد، تاریخ، منبع یا پیوندی جعل نکن. گزارش منابع را جای مقاله نگذار. "
-        "برای هر منبع، عنوان و خلاصه جست‌وجو و در صورت موفقیت متن استخراج‌شده از صفحه واقعی پیوست شده است. "
-        "در مواردی که متن صفحه دریافت نشده، فقط به همان خلاصه محدود بمان و وانمود نکن کل سند را خوانده‌ای. "
-        "ادعاهای فنی مهم را با چند منبع مستقل موجود تطبیق بده؛ اگر پشتوانه چندمنبعی وجود ندارد، آن را قطعی ننویس. "
-        "میان داده تأییدشده، گزارش تأییدنشده، برآورد/تحلیل، اختلاف منابع و اطلاعات ناکافی تمایز بگذار. "
-        "مشخصات نسخه‌های مختلف تجهیزات را مخلوط نکن. تاریخ انتشار منبع و تاریخ رویداد را در صورت وجود تفکیک کن. "
-        "اگر شواهد کافی نیست، آن محدودیت را در متن مدیریتی و نه در ادعای قطعی توضیح بده. "
-        "خروجی فارسی و دقیق با دو بخش ARTICLE و SOURCES باشد؛ SOURCES فقط در پنل مدیر استفاده می‌شود.\n\n"
-        f"موضوع: {topic}\n\nنتایج جست‌وجوی وب:\n{evidence}"
+        + "\n\nیک مقاله مستند و تحلیلی کامل بر اساس پرونده چندمحوری زیر بنویس. "
+        "مقاله باید تمام محورهای اصلی را پوشش دهد و از شواهد واقعی پیوست فراتر نرود. "
+        "ادعاهای فنی مهم را با بیش از یک منبع موجود مقایسه کن؛ اختلاف منابع و شکاف اطلاعاتی را پنهان نکن. "
+        "برای موضوعات روز، تاریخ انتشار منبع و تاریخ رویداد را جدا کن و وضعیت فعلی را فقط در صورت وجود شواهد جدید بیان کن. "
+        "نام منابع، نام اسناد، URL و ارجاع‌ها فقط در SOURCES باشند و داخل ARTICLE نیایند. "
+        "خروجی فارسی با دو بخش ARTICLE و SOURCES باشد؛ SOURCES فقط برای پنل مدیر است.\n\n"
+        f"موضوع: {topic}\nپرونده تحلیل محورها:\n{'\n\n'.join(dossier_parts)}\n\nمنابع گردآوری‌شده:\n{sources_evidence}\n\n"
+        f"اختلاف‌های ثبت‌شده: {json.dumps(workflow.get('contradictions', []), ensure_ascii=False)}\n"
+        f"اطلاعات ناکافی: {json.dumps(workflow.get('information_gaps', []), ensure_ascii=False)}"
     )
-    article, raw = "", {}
-    last_output_error = ""
-    for attempt in range(3):
-        result, raw = project_ai_call(project, prompt, use_search=True)
-        article = _split_article_sources(result)
-        if len(article) >= 100:
-            break
-        last_output_error = "پاسخ مدل برای مقاله تحلیلی بیش از حد کوتاه بود."
-        _rotate_project_provider_order(project)
+    result, raw = project_ai_call(project, prompt, use_search=True)
+    article = _split_article_sources(result)
     if len(article) < 100:
-        raise AnalyticsError(last_output_error or "خروجی تحقیق به مقاله کافی تبدیل نشد؛ پروژه برای بازبینی/تلاش مجدد حفظ شد.")
-    project["research_ai_provider"] = project.get("last_ai_provider") or project.get("ai_provider_override")
+        raise AIUnavailableError("مقاله نهایی از حداقل کیفیت طول/محتوا عبور نکرد؛ پروژه با پرونده تحقیق ذخیره و دوباره تلاش می‌شود.")
     project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_research"})
+    project["article_versions"] = project["article_versions"][-50:]
     project["article"] = article
-    project["sources"] = sources
+    project["sources"] = all_sources
     project["approved_article"] = False
     project["approved_posts"] = False
     for old_post in project.get("posts", []):
@@ -625,28 +743,37 @@ def research_project(project: dict):
             old_post["manual_schedule"] = False
     candidate = (raw.get("candidates") or [{}])[0] if isinstance(raw, dict) else {}
     grounding = candidate.get("groundingMetadata") if isinstance(candidate, dict) else None
-    known_urls = {str(x.get("url", "")) for x in sources}
+    known_urls = {str(x.get("url", "")) for x in all_sources}
     if isinstance(grounding, dict):
         for chunk in grounding.get("groundingChunks", []) or []:
             web = chunk.get("web", {}) if isinstance(chunk, dict) else {}
             url = str(web.get("uri", "")).strip()
             if not url or url in known_urls or not url.startswith("https://"):
                 continue
-            sources.append({"title": str(web.get("title", "منبع Google Search grounding"))[:240], "url": url,
-                            "snippet": "منبع برگشتی از Google Search grounding؛ محتوای صفحه باید توسط مدیر بررسی شود.",
-                            "retrieved_at": now_ts(), "status": "needs_review", "origin": "gemini_grounding"})
+            all_sources.append({"title": str(web.get("title", "منبع Google Search grounding"))[:240], "url": url,
+                                "snippet": "منبع برگشتی از Google Search grounding؛ محتوا در صورت امکان دریافت می‌شود.",
+                                "retrieved_at": now_ts(), "status": "needs_review", "origin": "gemini_grounding"})
             known_urls.add(url)
-    project["sources"] = sources
+    project["sources"] = all_sources
+    workflow["stage"] = "awaiting_manager_review"
+    workflow["completed_at"] = now_ts()
+    workflow["source_count"] = len(all_sources)
+    workflow["unique_axes_completed"] = len(workflow.get("axis_analysis", {}))
+    workflow["freshness_checked_at"] = now_ts()
+    workflow["provider"] = project.get("last_ai_provider") or project.get("ai_provider_override") or "unknown"
     project["research_grounding"] = {
-        "search_results": len(sources),
-        "search_providers": sorted({str(x.get("search_provider", "unknown")) for x in sources}),
+        "search_results": len(all_sources),
+        "search_providers": sorted({str(x.get("search_provider", "unknown")) for x in all_sources}),
         "gemini_grounding_metadata": bool(grounding), "completed_at": now_ts(),
-        "provider": project.get("last_ai_provider") or project.get("ai_provider_override") or "unknown",
-        "method": "Multi-engine public web search; Gemini Google Search grounding used when Gemini completed the research" if project.get("last_ai_provider") == "gemini" else "Multi-engine public web search with attached search evidence",
+        "provider": workflow["provider"],
+        "method": "Staged multi-axis web research; Google Search grounding requested when Gemini is used and supported",
     }
+    project["research_contradictions"] = copy.deepcopy(workflow.get("contradictions", []))
+    project["research_gaps"] = copy.deepcopy(workflow.get("information_gaps", []))
     project["status"] = "review_research"
     project["last_error"] = ""
-    _append_history(project, "research_completed", f"sources={len(sources)}")
+    _append_history(project, "research_completed", f"sources={len(all_sources)}; axes={workflow['unique_axes_completed']}")
+    _checkpoint_project(project)
     return project
 
 
@@ -832,7 +959,7 @@ def split_into_posts(project: dict, count=None, tone=None):
 
 def _commons_search_once(query: str, limit: int):
     """Search Commons file namespace and resolve real imageinfo URLs."""
-    headers = {"User-Agent": "RaptorAnalytics/5.91 (Telegram analytical content bot)"}
+    headers = {"User-Agent": "RaptorAnalytics/5.92 (Telegram analytical content bot)"}
     search = requests.get("https://commons.wikimedia.org/w/api.php", params={
         "action": "query", "list": "search", "srsearch": f"filetype:bitmap {query}",
         "srnamespace": 6, "srlimit": min(10, max(1, int(limit))), "format": "json",
@@ -886,65 +1013,251 @@ def _commons_search_once(query: str, limit: int):
     return out
 
 
+def _image_tokens(value: str) -> set[str]:
+    tokens = set(re.findall(r"[a-z0-9]+|[\u0600-\u06ff]{2,}", str(value or "").casefold()))
+    stop = {"the", "and", "for", "with", "photo", "image", "file", "of", "in", "a", "an", "تصویر", "عکس", "واقعی", "نمای", "از", "برای", "با"}
+    return {x for x in tokens if len(x) > 1 and x not in stop}
+
+
+def image_relevance_score(query: str, image: dict) -> float:
+    q = _image_tokens(query)
+    title = _image_tokens(str(image.get("title", "")) + " " + str(image.get("search_query", "")))
+    if not q or not title:
+        return 0.0
+    overlap = len(q & title) / max(1, len(q))
+    ratio = difflib.SequenceMatcher(None, " ".join(sorted(q)), " ".join(sorted(title))).ratio()
+    exact_bonus = 0.2 if any(token in title for token in q if len(token) >= 3) else 0.0
+    return min(1.0, overlap * 0.7 + ratio * 0.2 + exact_bonus)
+
+
+def persist_image_asset(image: dict) -> dict:
+    """Download a verified Wikimedia image to durable storage when available."""
+    item = copy.deepcopy(image or {})
+    url = str(item.get("url", ""))
+    parsed = urlparse(url)
+    if not url or parsed.scheme != "https" or parsed.hostname != "upload.wikimedia.org":
+        return item
+    if item.get("local_path") and os.path.isfile(item["local_path"]):
+        return item
+    root = str(ensure_state({}).get("settings", {}).get("image_storage_dir") or os.getenv("ANALYTICS_IMAGE_DIR", "analytics_media"))
+    os.makedirs(root, exist_ok=True)
+    ext = ".jpg" if str(item.get("mime", "")).lower() == "image/jpeg" else ".png" if str(item.get("mime", "")).lower() == "image/png" else ".webp"
+    name = hashlib.sha256(url.encode("utf-8")).hexdigest() + ext
+    path = os.path.join(root, name)
+    if not os.path.isfile(path):
+        response = requests.get(url, headers={"User-Agent": "RaptorAnalytics/5.92"}, timeout=25, stream=True, allow_redirects=False)
+        if response.status_code != 200:
+            response.close()
+            return item
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if not content_type.startswith("image/"):
+            response.close()
+            return item
+        total = 0
+        chunks = []
+        for chunk in response.iter_content(64 * 1024):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_IMAGE_BYTES:
+                response.close()
+                return item
+            chunks.append(chunk)
+        response.close()
+        if total < 1024:
+            return item
+        temp = path + ".tmp"
+        with open(temp, "wb") as handle:
+            for chunk in chunks:
+                handle.write(chunk)
+        os.replace(temp, path)
+    item["local_path"] = path
+    item["stored_at"] = now_ts()
+    item["storage"] = "persistent_volume" if path.startswith("/data/") else "local_filesystem"
+    return item
+
+
 def search_images(query: str, limit=5):
-    """Search real, direct Commons images using progressively broader relevant terms."""
+    """Search real Commons files; rank by query relevance and discard unrelated candidates."""
     raw = (query or "").strip()
     if not raw:
         return []
     variants = [raw]
-    # A long model-generated query can be too restrictive. Try a compact noun phrase too.
-    compact = " ".join(re.findall(r"[\w\u0600-\u06FF-]+", raw)[:7]).strip()
+    compact = " ".join(re.findall(r"[\w\u0600-\u06FF-]+", raw)[:8]).strip()
     if compact and compact.casefold() != raw.casefold():
         variants.append(compact)
-    seen, results = set(), []
-    errors = []
-    for variant in variants:
+    # Search common transliterated aliases for Persian queries without widening to generic stock imagery.
+    terms = list(_image_tokens(raw))
+    if terms:
+        variants.append(" ".join(terms[:6]))
+    seen, results, errors = set(), [], []
+    for variant in dict.fromkeys(variants):
         try:
-            matches = _commons_search_once(variant, limit)
+            matches = _commons_search_once(variant, max(limit * 2, 6))
             for item in matches:
-                if item.get("url") not in seen:
-                    seen.add(item.get("url"))
+                url = item.get("url")
+                if not url or url in seen:
+                    continue
+                seen.add(url)
+                item["relevance_score"] = image_relevance_score(raw, item)
+                item["search_query"] = variant
+                if item["relevance_score"] >= 0.08 or len(terms) <= 1:
                     results.append(item)
-            if len(results) >= limit:
-                break
         except Exception as exc:
             errors.append(type(exc).__name__)
             log.warning("Wikimedia image search failed for query %r: %s", variant[:80], type(exc).__name__)
+    results.sort(key=lambda x: (float(x.get("relevance_score", 0)), bool(x.get("local_path"))), reverse=True)
+    # Never fill a project with a generic unrelated image just to satisfy the image count.
     return results[:max(1, int(limit))]
 
 
-def attach_images(project: dict, limit_per_post=3):
-    """Find relevant candidates and preselect the best verified result for review.
+def persist_telegram_image_asset(file_id: str, title: str = "تصویر ارسالی مدیر") -> dict:
+    """Download a Telegram upload to the analytical media directory; retain file_id as fallback."""
+    item = {"file_id": str(file_id or ""), "title": str(title or "تصویر ارسالی مدیر")[:180],
+            "source_url": "telegram-upload", "added_at": now_ts()}
+    token = os.getenv("BOT_TOKEN", "").strip()
+    if not token or not item["file_id"]:
+        return item
+    try:
+        metadata = requests.get(f"https://api.telegram.org/bot{token}/getFile",
+                                params={"file_id": item["file_id"]}, timeout=15)
+        metadata.raise_for_status()
+        payload = metadata.json()
+        file_path = str(payload.get("result", {}).get("file_path", ""))
+        if not payload.get("ok") or not file_path or file_path.startswith("/") or ".." in file_path.split("/"):
+            return item
+        url = f"https://api.telegram.org/file/bot{token}/{file_path}"
+        response = requests.get(url, timeout=25, stream=True, allow_redirects=False)
+        if response.status_code != 200:
+            response.close()
+            return item
+        content_type = str(response.headers.get("Content-Type", "")).lower()
+        if not content_type.startswith("image/"):
+            response.close()
+            return item
+        root = os.getenv("ANALYTICS_IMAGE_DIR", "/data/analytics_media" if os.path.isdir("/data") else "analytics_media")
+        os.makedirs(root, exist_ok=True)
+        suffix = os.path.splitext(file_path)[1].lower()
+        if suffix not in {".jpg", ".jpeg", ".png", ".webp"}:
+            suffix = ".jpg" if "jpeg" in content_type else ".png" if "png" in content_type else ".webp"
+        name = hashlib.sha256(item["file_id"].encode("utf-8")).hexdigest() + suffix
+        final_path = os.path.join(root, name)
+        if not os.path.isfile(final_path):
+            total, chunks = 0, []
+            for chunk in response.iter_content(64 * 1024):
+                if not chunk:
+                    continue
+                total += len(chunk)
+                if total > MAX_IMAGE_BYTES:
+                    response.close()
+                    return item
+                chunks.append(chunk)
+            if total < 1024:
+                response.close()
+                return item
+            temp_path = final_path + ".tmp"
+            with open(temp_path, "wb") as target:
+                for chunk in chunks:
+                    target.write(chunk)
+            os.replace(temp_path, final_path)
+        response.close()
+        item.update({"local_path": final_path, "mime": content_type.split(";", 1)[0],
+                     "storage": "persistent_volume" if final_path.startswith("/data/") else "local_filesystem",
+                     "stored_at": now_ts()})
+    except Exception as exc:
+        log.warning("Could not persist manager Telegram image: %s", type(exc).__name__)
+    return item
 
-    Selection is not publication approval: posts remain drafts until an admin
-    reviews the image and explicitly approves/schedules the post.
-    """
+
+def _add_project_gallery_image(project: dict, image: dict) -> int:
+    url = image.get("url") or image.get("file_id")
+    if not url:
+        return len(project.get("images", []))
+    gallery = project.setdefault("images", [])
+    if any((x.get("url") or x.get("file_id")) == url for x in gallery if isinstance(x, dict)):
+        return len(gallery)
+    gallery.append(copy.deepcopy(image))
+    project["images"] = gallery[-100:]
+    return len(project["images"])
+
+
+def attach_images(project: dict, limit_per_post=4):
+    """Search a post-specific image set, persist each asset in project gallery and auto-assign one."""
     total = 0
     auto_selected = 0
+    used_urls = {str(img.get("url") or img.get("file_id")) for p in project.get("posts", [])
+                 for img in p.get("images", []) if isinstance(img, dict)}
+    gallery = project.setdefault("images", [])
     for post in project.get("posts", []):
-        existing = {x.get("url") for x in post.get("image_candidates", []) if isinstance(x, dict)}
-        queries = [post.get("image_query"), post.get("title"), project.get("title"), project.get("topic")]
-        if len(post.get("image_candidates", [])) < limit_per_post:
-            for query in dict.fromkeys(str(q).strip() for q in queries if str(q or "").strip()):
-                matches = [x for x in search_images(query, limit_per_post)
-                           if x.get("url") and x.get("url") not in existing]
-                post.setdefault("image_candidates", []).extend(matches)
-                existing.update(x.get("url") for x in matches)
+        existing = {x.get("url") or x.get("file_id") for x in post.get("image_candidates", []) if isinstance(x, dict)}
+        query = str(post.get("image_query") or post.get("title") or project.get("title") or project.get("topic") or "").strip()
+        if query and len(post.get("image_candidates", [])) < limit_per_post:
+            matches = search_images(query, max(limit_per_post * 2, 6))
+            ranked = sorted(matches, key=lambda x: float(x.get("relevance_score", image_relevance_score(query, x))), reverse=True)
+            for candidate in ranked:
+                key = candidate.get("url")
+                if not key or key in existing:
+                    continue
+                candidate_score = float(candidate.get("relevance_score", image_relevance_score(query, candidate)))
+                candidate["relevance_score"] = candidate_score
+                if candidate_score < 0.08:
+                    continue
+                try:
+                    candidate = persist_image_asset(candidate)
+                except Exception as exc:
+                    log.warning("Could not persist analytical image: %s", type(exc).__name__)
+                candidate["for_post_id"] = post.get("id")
+                candidate["relevance_to_post"] = float(candidate.get("relevance_score", 0))
+                post.setdefault("image_candidates", []).append(candidate)
+                _add_project_gallery_image(project, candidate)
+                existing.add(key)
                 if len(post["image_candidates"]) >= limit_per_post:
                     break
         post["image_candidates"] = post.get("image_candidates", [])[:12]
-        # The first query is generated for the specific post, so the first
-        # accessible match is the default choice. Preserve manual selections.
-        if not post.get("images") and post.get("image_candidates"):
-            chosen = copy.deepcopy(post["image_candidates"][0])
+        if not post.get("images"):
+            targeted = [x for x in post.get("image_candidates", []) if x.get("for_post_id") == post.get("id")]
+            ranked = sorted(targeted, key=lambda x: float(x.get("relevance_to_post", x.get("relevance_score", 0))), reverse=True)
+            chosen = next((x for x in ranked if (x.get("url") or x.get("file_id")) not in used_urls), None)
+            if chosen:
+                selected = copy.deepcopy(chosen)
+                selected["auto_selected"] = True
+                selected["selection_note"] = "تصویر مرتبط با جست‌وجوی اختصاصی همین پست؛ پیش از انتشار بازبینی شود."
+                post["images"] = [selected]
+                post["image_auto_selected"] = True
+                post["image_needs_review"] = True
+                used_urls.add(str(selected.get("url") or selected.get("file_id")))
+                auto_selected += 1
+        total += len(post.get("image_candidates", []))
+
+    # Map manager-uploaded gallery images to posts that remain image-less. Prefer title/query matches;
+    # then use unused manager-uploaded images in arrival order as project-scoped material.
+    for post in project.get("posts", []):
+        if post.get("images"):
+            continue
+        query = str(post.get("image_query") or post.get("title") or project.get("title") or "")
+        candidates = []
+        for image in project.get("images", []):
+            key = str(image.get("url") or image.get("file_id") or "")
+            if not key or key in used_urls:
+                continue
+            score = image_relevance_score(query, image)
+            # Uploaded files stay in the project gallery until their caption/title
+            # actually matches a post. Never attach an unrelated image just to fill a slot.
+            if score >= 0.12:
+                candidates.append((score, image))
+        if candidates:
+            candidates.sort(key=lambda pair: pair[0], reverse=True)
+            chosen = copy.deepcopy(candidates[0][1])
             chosen["auto_selected"] = True
-            chosen["selection_note"] = "انتخاب اولیه خودکار بر اساس عبارت تصویر همین پست؛ پیش از انتشار بازبینی شود."
+            chosen["selection_note"] = "اتصال خودکار از گالری اختصاصی پروژه؛ بازبینی مدیر لازم است."
             post["images"] = [chosen]
             post["image_auto_selected"] = True
+            post["image_needs_review"] = True
+            used_urls.add(str(chosen.get("url") or chosen.get("file_id")))
             auto_selected += 1
-        total += len(post.get("image_candidates", []))
+    total += len(project.get("images", []))
     project["updated_at"] = now_ts()
-    _append_history(project, "images_searched", f"candidate_total={total}; auto_selected={auto_selected}")
+    _append_history(project, "images_searched_and_assigned", f"gallery={len(project.get('images', []))}; candidates={total}; auto_selected={auto_selected}")
     return total
 
 
@@ -1011,37 +1324,61 @@ def edit_post(project: dict, post_id: str, text: str, title=None, actor=None):
 
 
 def rewrite_post(project: dict, post_id: str, instruction: str, actor=None):
+    """Rewrite only one post, with bounded repair retries and immutable prior version."""
     post = find_post(project, post_id)
     if not post: raise AnalyticsError("پست موردنظر پیدا نشد.")
     if post.get("status") in {"published", "sending", "uncertain"}:
         raise AnalyticsError("پست منتشرشده یا با نتیجه نامشخص قابل بازنویسی در صف نیست.")
-    prompt = (
-        style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "telegram")
-        + "\n\nفقط پست زیر را مطابق دستور مدیر بازنویسی کن. از منابع متن پروژه فراتر نرو؛ هیچ واقعیت/عدد/تاریخی نساز. "
-        "متن فارسی تلگرامی، طبیعی و مستقل باشد؛ در خروجی فقط متن پست را بده، بدون توضیح داخلی و بدون footer. "
-        "حداکثر ۹۰۰ نویسه پیش از footer.\nدستور مدیر: " + instruction +
-        "\nعنوان: " + str(post.get("title", "")) + "\nمتن فعلی:\n" + _clean_body(post.get("text", "")) +
-        "\nمتن منبع پروژه:\n" + str(project.get("article") or project.get("source_text") or "")[:18000]
+    source = str(project.get("article") or project.get("source_text") or "")[:18000]
+    custom = str(project.get("_style_custom_instructions", ""))
+    base_prompt = (
+        style_engine.build_style_prompt(custom, "telegram")
+        + "\n\nفقط همین یک پست را مطابق دستور مدیر بازنویسی کن. منبع را مبنا قرار بده و هیچ عدد، واقعیت یا تاریخ تازه نساز. "
+        "عنوان را در صورت نیاز حفظ کن؛ خروجی فقط متن پست باشد، بدون عنوان مدیریتی و بدون footer. "
+        "بدنه باید آن‌قدر فشرده باشد که پس از افزودن footer کمتر از ۹۷۰ نویسه بماند. "
+        f"\nدستور مدیر: {instruction}\nعنوان: {post.get('title','')}"
+        f"\nمتن فعلی:\n{_clean_body(post.get('text',''))}\nمنبع پروژه:\n{source}"
     )
-    response, _ = project_ai_call(project, prompt)
-    candidate = _footer_text(response)
-    if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
-        raise AnalyticsError("خروجی بازنویسی از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
-    if project.get("_style_quality_review", True):
-        reviewed = _quality_review_candidate_posts(
-            project,
-            str(project.get("article") or project.get("source_text") or "")[:18000],
-            [{**copy.deepcopy(post), "text": candidate, "char_count": len(candidate), "status": "draft"}],
-        )
-        candidate = reviewed[0]["text"]
-    else:
+    last_error = ""
+    candidate = ""
+    for attempt in range(3):
+        prompt = base_prompt
+        if attempt:
+            prompt += ("\n\nخروجی قبلی از کنترل عبور نکرد. این بار دقیقاً همان معنا و اطلاعات را نگه دار، "
+                       "متن را کوتاه‌تر و بدون گیومه/پرانتز/کلیشه بنویس و فقط متن نهایی را برگردان. "
+                       f"علت رد: {last_error[:300]}")
+        response, _ = project_ai_call(project, prompt)
+        candidate = _footer_text(response)
+        if not candidate:
+            last_error = "خروجی خالی بود."
+            continue
+        if len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
+            last_error = f"متن {len(candidate)} نویسه داشت و از سقف مجاز بیشتر بود."
+            continue
         style_errors = style_engine.style_issues(_clean_body(candidate))
         if style_errors:
-            raise AnalyticsError("خروجی بازنویسی با قواعد سبک سازگار نیست: " + "؛ ".join(style_errors[:5]))
-    if not candidate or len(candidate) > MAX_POST_CHARS or len(candidate.encode("utf-16-le")) // 2 > 1024:
-        raise AnalyticsError("خروجی بازنویسی پس از کنترل کیفیت از اعتبارسنجی مستقل عبور نکرد؛ نسخه قبلی حفظ شد.")
+            last_error = "؛ ".join(style_errors[:5])
+            continue
+        if project.get("_style_quality_review", True):
+            try:
+                reviewed = _quality_review_candidate_posts(
+                    project, source,
+                    [{**copy.deepcopy(post), "text": candidate, "char_count": len(candidate), "status": "draft"}],
+                )
+                candidate = reviewed[0]["text"]
+            except AIUnavailableError:
+                raise
+            except AnalyticsError as exc:
+                last_error = str(exc)
+                continue
+        if candidate and len(candidate) <= MAX_POST_CHARS and len(candidate.encode("utf-16-le")) // 2 <= 1024:
+            break
+        last_error = "نسخه پس از کنترل کیفیت از سقف مجاز عبور کرد."
+    else:
+        raise AnalyticsError("بازنویسی پس از سه تلاش معتبر نشد؛ نسخه قبلی دست‌نخورده باقی ماند. " + last_error[:350])
     snapshot_post(post, "before_ai_rewrite:" + instruction[:60], actor)
     post["text"] = candidate
+    post["char_count"] = len(candidate)
     post["style_validation_version"] = style_engine.STYLE_VERSION
     post["status"] = "needs_review"
     post["scheduled_ts"] = None
@@ -1064,6 +1401,8 @@ def select_image(project: dict, post_id: str, image_index: int):
     img = copy.deepcopy(candidates[int(image_index)])
     snapshot_post(post, "before_image_change")
     post["images"] = [img]
+    post["image_needs_review"] = False
+    post["image_reviewed"] = True
     post["updated_at"] = now_ts()
     project["updated_at"] = now_ts()
     _append_history(project, "image_selected", f"post={post_id}; index={image_index}")
@@ -1088,8 +1427,23 @@ def assign_project_image(project: dict, post_id: str, image_index: int, replace=
     item = copy.deepcopy(images[int(image_index)])
     if replace: post["images"] = [item]
     else: post.setdefault("images", []).append(item)
+    post["image_needs_review"] = False
+    post["image_reviewed"] = True
     post["updated_at"] = now_ts()
     _append_history(project, "project_image_assigned", f"post={post_id}; image={image_index}")
+    return post
+
+
+def approve_post_image(project: dict, post_id: str):
+    post = find_post(project, post_id)
+    if not post:
+        raise AnalyticsError("پست موردنظر پیدا نشد.")
+    if not post.get("images"):
+        raise AnalyticsError("برای تأیید، ابتدا باید یک تصویر به پست متصل باشد.")
+    post["image_needs_review"] = False
+    post["image_reviewed"] = True
+    post["updated_at"] = now_ts()
+    _append_history(project, "post_image_reviewed", f"post={post_id}")
     return post
 
 
@@ -1118,22 +1472,37 @@ def reorder_post_images(project: dict, post_id: str, order):
 
 
 def research_addendum(project: dict, request_text: str):
-    if project.get("kind") != "research": raise AnalyticsError("این قابلیت فقط برای پروژه‌های تحقیق از موضوع است.")
+    """Complete only requested research gaps and persist evidence before the AI call."""
+    if project.get("kind") != "research":
+        raise AnalyticsError("این قابلیت فقط برای پروژه‌های تحقیق از موضوع است.")
     query = (request_text or project.get("topic", "")).strip()
-    results = web_search(query + " official updated report technical historical", 6)
-    if not results: raise AnalyticsError("جست‌وجوی تکمیلی نتیجه‌ای نداد؛ مقاله قبلی حفظ شد.")
+    if not query:
+        raise AnalyticsError("درخواست تکمیل تحقیق خالی است.")
+    pending = project.get("pending_addendum")
+    if not isinstance(pending, dict) or pending.get("request_text") != query:
+        results = web_search(query + " official updated report technical historical", 6)
+        if not results:
+            raise AIUnavailableError("جست‌وجوی تکمیلی نتیجه‌ای نداد؛ مقاله قبلی حفظ و پروژه در صف باقی می‌ماند.")
+        pending = {"request_text": query, "results": copy.deepcopy(results), "retrieved_at": now_ts(), "stage": "evidence_saved"}
+        project["pending_addendum"] = pending
+        project["research_workflow"] = project.get("research_workflow") or {}
+        project["research_workflow"]["pending_addendum"] = {"request_text": query, "source_count": len(results), "retrieved_at": pending["retrieved_at"]}
+        _checkpoint_project(project)
+    results = pending.get("results", [])
     evidence = "\n\n".join(
-        f"[{i+1}] {x['title']}\nURL: {x['url']}\nخلاصه جست‌وجو: {x.get('snippet','')}\n"
+        f"[{i+1}] {x.get('title','')}\nURL: {x.get('url','')}\nخلاصه جست‌وجو: {x.get('snippet','')}\n"
         f"وضعیت دریافت صفحه: {x.get('fetch_status','snippet_only')}\n"
         f"متن استخراج‌شده: {x.get('content_excerpt') or 'متن صفحه دریافت نشد؛ صرفاً خلاصه جست‌وجو موجود است.'}"
         for i, x in enumerate(results))
     prompt = (style_engine.build_style_prompt(str(project.get("_style_custom_instructions", "")), "research")
-              + "\n\nمقاله موجود را با شواهد تازه زیر تکمیل کن. متن قبلی را پاک نکن مگر آنکه دقیقاً اصلاح شود. "
-              "ادعاهای جدید را از تحلیل/برآورد جدا کن و چیزی نساز. فقط ARTICLE و SOURCES بده. "
-              f"\nدرخواست مدیر: {request_text}\nمقاله فعلی:\n{project.get('article','')}\nشواهد جدید:\n{evidence}")
+              + "\n\nفقط شکاف‌های تحقیقاتی یا درخواست مشخص‌شده را تکمیل کن. مقاله قبلی را حفظ کن و فقط در صورت وجود شواهد روشن اصلاح کن. "
+              "ادعاهای تازه را از تحلیل/برآورد جدا کن، تاریخ انتشار منبع را از تاریخ رویداد تفکیک کن و چیزی نساز. "
+              "خروجی فقط ARTICLE و SOURCES باشد؛ نام منابع فقط در SOURCES قرار گیرد. "
+              f"\nدرخواست مدیر: {query}\nمقاله فعلی:\n{project.get('article','')}\nشواهد جدید:\n{evidence}")
     response, raw = project_ai_call(project, prompt, use_search=True)
     article = _split_article_sources(response)
-    if len(article) < 100: raise AnalyticsError("تحقیق تکمیلی خروجی قابل استفاده نداشت؛ مقاله قبلی حفظ شد.")
+    if len(article) < 100:
+        raise AIUnavailableError("تحقیق تکمیلی خروجی قابل استفاده نداشت؛ مقاله قبلی و شواهد جدید ذخیره شدند و پروژه دوباره تلاش می‌شود.")
     project.setdefault("article_versions", []).append({"at": now_ts(), "article": project.get("article", ""), "action": "before_addendum"})
     project["article_versions"] = project["article_versions"][-50:]
     project["article"] = article
@@ -1146,14 +1515,18 @@ def research_addendum(project: dict, request_text: str):
             old_post["manual_schedule"] = False
     existing = {x.get("url") for x in project.get("sources", [])}
     project.setdefault("sources", []).extend({
-        "title": x["title"], "url": x["url"], "snippet": x.get("snippet", ""),
+        "title": x.get("title", ""), "url": x.get("url", ""), "snippet": x.get("snippet", ""),
         "content_excerpt": x.get("content_excerpt", ""), "fetch_status": x.get("fetch_status", "snippet_only"),
-        "search_provider": x.get("search_provider", "unknown"),
-        "fetched_at": x.get("fetched_at"), "retrieved_at": now_ts(), "status": "needs_review"
-    } for x in results if x.get("url") not in existing)
+        "search_provider": x.get("search_provider", "unknown"), "fetched_at": x.get("fetched_at"),
+        "retrieved_at": x.get("retrieved_at", now_ts()), "status": "needs_review", "research_axis": "addendum"
+    } for x in results if x.get("url") and x.get("url") not in existing)
+    project.pop("pending_addendum", None)
+    if isinstance(project.get("research_workflow"), dict):
+        project["research_workflow"].pop("pending_addendum", None)
     project["approved_article"] = False
     project["status"] = "review_research"
-    _append_history(project, "research_updated", request_text[:160])
+    _append_history(project, "research_updated", query[:160])
+    _checkpoint_project(project)
     return project
 
 
@@ -1171,7 +1544,9 @@ def _epoch(value):
 
 
 def news_times(state: dict, day_start: float, day_end: float):
-    """Read-only extraction of fixed news times. Never edits news queue/history."""
+    """Read-only extraction of news times; a paused news engine has no future news slots."""
+    if not bool(state.get("_news_engine_enabled", True)):
+        return []
     times = []
     for item in state.get("_pending_queue", []):
         if item.get("delivery_status") in {"uncertain", "partial", "sending", "sent"}:
@@ -1194,6 +1569,8 @@ def forecast_news_times(state: dict, day_start: float, day_end: float, tzinfo):
     A new actual news publication is checked again at runtime and can move only auto-scheduled
     analytics posts.
     """
+    if not bool(state.get("_news_engine_enabled", True)):
+        return []
     settings = state.get("_admin_settings", {}) if isinstance(state.get("_admin_settings"), dict) else {}
     start_hour = max(0, min(23, int(settings.get("active_start_hour", 8) or 8)))
     afternoon = max(start_hour, min(23, int(settings.get("afternoon_start_hour", 14) or 14)))
@@ -1253,7 +1630,7 @@ def _check_candidate(ts, news, analytic, gap):
 
 
 def propose_project_schedule(state: dict, project: dict, tzinfo):
-    """Assign the earliest feasible schedule; mutate analytics records only."""
+    """Distribute project posts across the full analytical window while respecting active news slots."""
     a = ensure_state(state); settings = a["settings"]
     if settings.get("schedule_mode", "auto") != "auto":
         raise AnalyticsError("زمان‌بندی دستی فعال است.")
@@ -1267,6 +1644,7 @@ def propose_project_schedule(state: dict, project: dict, tzinfo):
         raise AnalyticsError("تمام پست‌های این پروژه قبلاً منتشر شده‌اند.")
     start_hour, end_hour = int(settings.get("start_hour", 14)), int(settings.get("end_hour", 21))
     gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
+    news_is_active = bool(state.get("_news_engine_enabled", True))
     now = datetime.now(tzinfo)
     scheduled_projects = set()
     for other in a["projects"].values():
@@ -1280,55 +1658,77 @@ def propose_project_schedule(state: dict, project: dict, tzinfo):
                 scheduled_projects.add(datetime.fromtimestamp(other_ts, tzinfo).date().isoformat())
     for day_offset in range(0, 366):
         day = (now + timedelta(days=day_offset)).date(); day_key = day.isoformat()
-        if day_key in scheduled_projects: continue
+        if day_key in scheduled_projects:
+            continue
         begin = datetime(day.year, day.month, day.day, start_hour, 0, tzinfo=tzinfo)
         end = datetime(day.year, day.month, day.day, end_hour, 0, tzinfo=tzinfo)
-        cursor = max(begin, now + timedelta(minutes=1))
-        if cursor >= end: continue
+        first = max(begin, now + timedelta(minutes=1))
+        if first >= end:
+            continue
         day_start = datetime(day.year, day.month, day.day, 0, 0, tzinfo=tzinfo).timestamp()
         day_end = day_start + 86400
-        news = planning_news_times(state, begin.timestamp() - gap, end.timestamp() + gap, tzinfo)
+        news = planning_news_times(state, begin.timestamp() - gap, end.timestamp() + gap, tzinfo) if news_is_active else []
         other_analytic = _other_analytics_times(a, project.get("id"), day_start - gap, day_end + gap)
-        published_today = []
+        already_published = []
         for post in all_posts:
-            if post.get("status") != "published": continue
+            if post.get("status") != "published":
+                continue
             published_ts = _epoch(post.get("published_at"))
             if published_ts and day_start <= published_ts <= day_end:
-                published_today.append(published_ts)
-        assigned = sorted(published_today)
-        candidates = []
+                already_published.append(published_ts)
+        count = len(active_posts)
+        duration = max(0.0, (end - first).total_seconds())
+        # Spread evenly rather than greedily consuming the first available gaps.
+        targets = [first.timestamp() + (duration * ((i + 0.5) / count)) for i in range(count)]
+        assigned = sorted(already_published)
+        chosen = []
         feasible = True
-        prev_analytic = assigned[-1] if assigned else None
+        previous = assigned[-1] if assigned else None
         for index, post in enumerate(active_posts):
-            candidate = cursor
-            needs_news_before = prev_analytic is not None
-            if needs_news_before:
-                next_news = [x for x in news if x >= prev_analytic + gap and x < end.timestamp()]
-                if not next_news:
-                    feasible = False; break
-                candidate = max(candidate, datetime.fromtimestamp(next_news[0] + gap, tz=tzinfo))
-            while candidate < end:
-                ts = candidate.timestamp()
-                conflicts = [x for x in news + other_analytic + assigned + candidates if abs(x - ts) < gap]
-                if not conflicts: break
-                candidate = datetime.fromtimestamp(max(conflicts) + gap, tz=tzinfo)
-            if candidate >= end:
-                feasible = False; break
-            ts = candidate.timestamp()
-            if prev_analytic is not None and not any(prev_analytic < n < ts for n in news):
-                feasible = False; break
-            candidates.append(ts); prev_analytic = ts; cursor = candidate + timedelta(minutes=1)
-        if feasible:
-            for post, ts in zip(active_posts, candidates):
+            target = targets[index]
+            candidates = []
+            step = 5 * 60
+            cursor = first.timestamp()
+            while cursor < end.timestamp():
+                candidates.append(cursor)
+                cursor += step
+            candidates.sort(key=lambda stamp: (abs(stamp - target), stamp))
+            selected = None
+            for stamp in candidates:
+                if previous is not None and stamp <= previous + gap:
+                    continue
+                conflicts = [x for x in news + other_analytic + assigned + chosen if abs(x - stamp) < gap]
+                if conflicts:
+                    continue
+                if news_is_active and previous is not None and not any(previous < n < stamp for n in news):
+                    continue
+                # Keep enough room after the selected slot for all remaining posts.
+                remaining = count - index - 1
+                if remaining and stamp + gap * remaining >= end.timestamp():
+                    continue
+                selected = stamp
+                break
+            if selected is None:
+                feasible = False
+                break
+            chosen.append(selected)
+            previous = selected
+        if feasible and len(chosen) == len(active_posts):
+            for post, stamp in zip(active_posts, chosen):
                 if post.get("status") in {"sending", "uncertain"}:
                     raise AnalyticsError("پروژه دارای ارسال نامشخص است؛ زمان‌بندی خودکار متوقف شد.")
-                post["scheduled_ts"] = ts; post["status"] = "scheduled"; post["manual_schedule"] = False
+                post["scheduled_ts"] = stamp
+                post["status"] = "scheduled"
+                post["manual_schedule"] = False
                 post["updated_at"] = now_ts()
-            project["publish_day"] = day_key; project["schedule_mode"] = "auto"
-            project["status"] = "scheduled"; project["updated_at"] = now_ts()
-            _append_history(project, "schedule_auto", day_key + f"; posts={len(active_posts)}")
-            return candidates
-    raise AnalyticsError("در ۳۶۵ روز آینده زمان خالی مطابق محدودیت‌ها پیدا نشد؛ صف تحلیلی حفظ شد و صف اخبار تغییر نکرد.")
+            project["publish_day"] = day_key
+            project["schedule_mode"] = "auto"
+            project["status"] = "scheduled"
+            project["updated_at"] = now_ts()
+            _append_history(project, "schedule_auto_spread", day_key + f"; posts={len(active_posts)}; window={start_hour}-{end_hour}; news_active={news_is_active}")
+            return chosen
+    raise AnalyticsError("در ۳۶۵ روز آینده زمان کافی مطابق محدودیت‌ها پیدا نشد؛ صف تحلیلی حفظ شد و صف اخبار تغییر نکرد.")
+
 
 def suggest_manual_schedule_times(state: dict, project: dict, post: dict, around_ts: float,
                                    tzinfo, limit: int = 5, days: int = 7) -> list[float]:
@@ -1390,13 +1790,15 @@ def propose_manual_schedule(state: dict, project: dict, timestamps, tzinfo):
     gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
     begin = min(datetime(x.year,x.month,x.day,0,0,tzinfo=tzinfo).timestamp() for x in local) - gap
     finish = max(datetime(x.year,x.month,x.day,23,59,tzinfo=tzinfo).timestamp() for x in local) + gap
-    news = planning_news_times(state, begin, finish, tzinfo)
+    news_is_active = bool(state.get("_news_engine_enabled", True))
+    news = planning_news_times(state, begin, finish, tzinfo) if news_is_active else []
     other = _other_analytics_times(a, project.get("id"), begin, finish)
     if any(not _check_candidate(ts, news, other, gap) for ts in values):
         raise AnalyticsError("حداقل یکی از زمان‌ها با خبر یا پست تحلیلی دیگر کمتر از ۲۰ دقیقه فاصله دارد.")
-    for i in range(1, len(values)):
-        if not any(values[i-1] < n < values[i] for n in news):
-            raise AnalyticsError(f"بین پست {i} و {i+1} باید حداقل یک خبر قرار بگیرد.")
+    if news_is_active:
+        for i in range(1, len(values)):
+            if not any(values[i-1] < n < values[i] for n in news):
+                raise AnalyticsError(f"بین پست {i} و {i+1} باید حداقل یک خبر قرار بگیرد.")
     day_keys = {x.date().isoformat() for x in local}
     # The stated rule is one project per day, not one project per timestamp.
     for other_pid, other_project in a["projects"].items():
@@ -1429,7 +1831,8 @@ def manual_schedule_single(state: dict, project: dict, post: dict, ts: float, tz
     if local.hour < start or local.hour > end or (local.hour == end and (local.minute or local.second)):
         raise AnalyticsError("زمان باید داخل بازه تحلیلی باشد.")
     gap = max(20, int(settings.get("min_news_gap_minutes", 20))) * 60
-    news = planning_news_times(state, ts-gap, ts+gap, tzinfo)
+    news_is_active = bool(state.get("_news_engine_enabled", True))
+    news = planning_news_times(state, ts-gap, ts+gap, tzinfo) if news_is_active else []
     if any(abs(n-ts) < gap for n in news):
         raise AnalyticsError("زمان پیشنهادی با زمان خبر/پنجره پیش‌بینی‌شده کمتر از ۲۰ دقیقه فاصله دارد.")
     # Other projects may not occupy this local day. The selected project may have multiple posts
@@ -1463,12 +1866,12 @@ def manual_schedule_single(state: dict, project: dict, post: dict, ts: float, tz
         raise AnalyticsError("ترتیب انتشار پروژه رعایت نشده است؛ این پست باید بعد از تمام پست‌های قبلی باشد.")
     if any(t <= ts for t, _ in later):
         raise AnalyticsError("ترتیب انتشار پروژه رعایت نشده است؛ این پست باید قبل از تمام پست‌های بعدی باشد.")
-    if prior:
+    if news_is_active and prior:
         prev_ts = max(prior, key=lambda pair: int(pair[1].get("number", 0)))[0]
         interval_news = planning_news_times(state, prev_ts, ts, tzinfo)
         if not any(prev_ts < n < ts for n in interval_news):
             raise AnalyticsError("بین پست قبلی همین پروژه و زمان جدید باید یک خبر قرار بگیرد.")
-    if later:
+    if news_is_active and later:
         next_ts = min(later, key=lambda pair: int(pair[1].get("number", 0)))[0]
         interval_news = planning_news_times(state, ts, next_ts, tzinfo)
         if not any(ts < n < next_ts for n in interval_news):
@@ -1517,6 +1920,53 @@ def mark_published(project: dict, post: dict, message_id):
     project["status"] = "completed" if project.get("posts") and all(x.get("status") in terminal for x in project.get("posts", [])) else "scheduled"
     project["updated_at"] = now_ts()
     _append_history(project, "post_published", f"post={post.get('id')}; message_id={message_id}")
+
+
+def delete_archived_project(state: dict, project_id: str) -> dict:
+    """Permanently remove an archived analytical project and its queued jobs from state."""
+    a = ensure_state(state)
+    pid = str(project_id)
+    project = a["projects"].get(pid)
+    if not project:
+        raise AnalyticsError("پروژه پیدا نشد یا قبلاً حذف شده است.")
+    if not project.get("archived") and project.get("status") != "archived":
+        raise AnalyticsError("برای حذف دائمی، ابتدا پروژه را بایگانی کن.")
+    if any(p.get("status") in {"sending", "uncertain"} for p in project.get("posts", [])):
+        raise AnalyticsError("پروژه دارای ارسال در حال انجام یا نامشخص است؛ حذف دائمی مجاز نیست.")
+    a["ai_queue"] = [x for x in a.get("ai_queue", []) if str(x.get("project_id")) != pid]
+    removed = a["projects"].pop(pid)
+    # Remove local media only when no remaining project references the same asset.
+    candidate_paths = set()
+    for image in removed.get("images", []):
+        if isinstance(image, dict) and image.get("local_path"):
+            candidate_paths.add(str(image["local_path"]))
+    for post in removed.get("posts", []):
+        for image in list(post.get("images", [])) + list(post.get("image_candidates", [])):
+            if isinstance(image, dict) and image.get("local_path"):
+                candidate_paths.add(str(image["local_path"]))
+    still_used = set()
+    for other_project in a["projects"].values():
+        for image in other_project.get("images", []):
+            if isinstance(image, dict) and image.get("local_path"):
+                still_used.add(str(image["local_path"]))
+        for post in other_project.get("posts", []):
+            for image in list(post.get("images", [])) + list(post.get("image_candidates", [])):
+                if isinstance(image, dict) and image.get("local_path"):
+                    still_used.add(str(image["local_path"]))
+    media_root = os.path.realpath(str(a.get("settings", {}).get("image_storage_dir") or
+                                      os.getenv("ANALYTICS_IMAGE_DIR", "/data/analytics_media" if os.path.isdir("/data") else "analytics_media")))
+    for path in candidate_paths - still_used:
+        try:
+            resolved = os.path.realpath(path)
+            # Only remove files inside the configured analytical media directory.
+            if os.path.commonpath([media_root, resolved]) == media_root and os.path.isfile(resolved):
+                os.remove(resolved)
+        except (OSError, ValueError):
+            log.warning("Could not remove archived project media path: %s", os.path.basename(path))
+    a.setdefault("history", []).append({"at": now_ts(), "action": "project_permanently_deleted", "project_id": pid,
+                                        "title": str(removed.get("title", ""))[:120]})
+    a["history"] = a["history"][-500:]
+    return removed
 
 
 def render_metrics(state: dict):
